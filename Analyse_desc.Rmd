@@ -1,0 +1,752 @@
+---
+title: "Analyses descriptives"
+output: html_document
+date: "2025-04-08"
+---
+
+
+
+# Imports
+
+```{r}
+# ------------------------------------------------------------
+# Packages nécessaires
+# ------------------------------------------------------------
+library(readxl)     # Lecture de fichiers Excel
+library(dplyr)      # Manipulation de données
+library(ggplot2)    # Graphiques
+library(tidyr)      # Transformation de données
+library(lubridate)  # Gestion des dates
+library(ISOweek)    # Conversion ISO week -> date
+library(gganimate)  # Animation ggplot
+library(scales)     # Échelles graphiques
+library(purrr)      # Fonctions de type map
+```
+
+
+1. Infection par FocTr4 détéctée sur bananiers Cavendish Mozambique ferme Lurio.
+2. Mesures pour contenir l'épidémie (La gestion reste similaire au reste de l’exploitation, mais avec un nombre réduit de personnes pouvant intervenir dans les zones infectées)
+3. Données par semaine entre mai 2014 à avril 2016 (103 semaines)
+4. Données agrégées par bloc (60 blocs) de 1 ha sauf sur les côtés 1/2 ha. Les sous blocs de 5 et 10 m².
+200 bananiers par grand bloc 
+5. chemin de 3 m entre les blocs+grande route
+6. variables étudiées: 
+          + nombre de malades
+          + nombre de malades cumulé 
+
+```{r}
+# Lecture du fichier CSV
+Infection_Table <- read.csv("Infection_Table_clean.csv", stringsAsFactors = TRUE)
+
+# Conversion de variables
+Infection_Table <- Infection_Table %>% 
+  mutate(
+    Date = as.Date(Date),
+    ligne = as.factor(ligne),
+    Route = ifelse(ligne == 5, "Grande route", NA),
+    Semaine_label = paste0("Semaine ", sprintf("%02d", Week), " (", Year, ")")
+  )
+
+# Calcul des distances euclidiennes au bloc C1
+Infection_Table <- Infection_Table %>%
+  mutate(
+    distance_C1_colonne = case_when(
+      colonne == 1 ~ abs(1.25 - 3),
+      colonne == 6 ~ abs(5.75 - 3),
+      TRUE ~ abs(as.numeric(colonne) - 3)
+    ),
+    distance_C1_ligne = abs(as.numeric(ligne) - 1),
+    distance_totale = sqrt(distance_C1_colonne^2 + distance_C1_ligne^2)
+  ) %>%
+  arrange(Date) %>%
+  mutate(Semaine_label = factor(Semaine_label, levels = unique(Semaine_label)))
+
+```
+
+Préparations données climatiques
+
+```{r}
+load("vtp.RData")  # Chargement des données climatiques
+
+# Création de la semaine ISO
+vtp <- vtp %>%
+  mutate(
+    ISO_semaine = paste0(as.character(iso_week), "-1"),
+    Date_semaine = ISOweek2date(ISO_semaine)
+  )
+
+```
+
+# Plans parcelle
+
+## Plan brut
+
+```{r}
+# Définition des colonnes et positions
+col_levels <- rev(levels(Infection_Table$colonne))
+col_widths <- ifelse(col_levels %in% c("A", "F"), 0.5, 1)
+x_min <- cumsum(c(0, head(col_widths, -1)))
+x_max <- x_min + col_widths
+x_center <- (x_min + x_max)/2
+
+col_coords <- data.frame(
+  colonne = col_levels,
+  width = col_widths,
+  x_center = x_center,
+  xmin = x_min,
+  xmax = x_max
+)
+
+# Coordonnées rectangulaires pour ggplot
+data_rect <- Infection_Table %>%
+  
+  # 1. Inverser l'ordre des niveaux de la colonne pour le graphique
+  mutate(colonne = factor(colonne, levels = rev(levels(colonne)))) %>%
+  
+  # 2. Joindre les coordonnées x pré-calculées pour chaque colonne
+  left_join(col_coords, by = "colonne") %>%
+  
+  # 3. Calcul des positions verticales pour les blocs
+  mutate(
+    row_num = as.numeric(ligne),    # numéro de ligne (axe y)
+    ymin = row_num - 0.5,           # bord inférieur du bloc
+    ymax = row_num + 0.5            # bord supérieur du bloc
+  ) %>%
+  
+  # 4. Définition des types de blocs et des noms pour labels
+  mutate(
+    col = as.character(colonne),    # conversion en caractère pour les conditions
+    bloc_type = case_when(          # type de bloc pour couleur
+      col == "C" & row_num == 5 ~ "Bloc central",                               # bloc central
+      (col %in% c("B", "D") & row_num == 5) | (col == "C" & row_num %in% c(4,6)) ~ "Bloc voisins",  # blocs voisins
+      TRUE ~ "Autre"                                                               # tous les autres blocs
+    ),
+    bloc_nom = case_when(           # texte à afficher dans certains blocs
+      col == "C" & row_num == 5 ~ "",        # bloc central sans texte
+      col == "B" & row_num == 5 ~ "droite",  # blocs voisins côté droit
+      col == "D" & row_num == 5 ~ "gauche",  # blocs voisins côté gauche
+      col == "C" & row_num == 4 ~ "haut",    # bloc au-dessus du central
+      col == "C" & row_num == 6 ~ "bas",     # bloc en-dessous du central
+      TRUE ~ ""                               # les autres blocs restent vides
+    )
+  )
+
+
+# Graphique plan de la parcelle (blocs vides + routes)
+parcelle_plot <- ggplot() +
+  # Blocs vides
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "white",
+    color = "black"
+  ) +
+  
+  # Grande route horizontale (ligne 5)
+  geom_segment(
+    data = filter(data_rect, row_num == 5),
+    aes(x = xmin, xend = xmax,
+        y = row_num + 0.5, yend = row_num + 0.5,
+        color = "Grande route"),
+    linewidth = 2
+  ) +
+  
+  # Routes verticales
+  {
+    route_cols <- c("F", "B", "C", "D", "E")
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      data.frame(x = x_max[i])
+    }) %>% bind_rows()
+    
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+  
+  # Couleurs des routes
+  scale_color_manual(
+    name = "",
+    values = c("Grande route" = "black", "Route moyenne" = "black")
+  ) +
+  
+  # Légende pour les routes
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linewidth = c(2, 1.1),
+        color = c("black", "black")
+      )
+    )
+  ) +
+  
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",
+    expand = c(0, 0)
+  ) +
+  
+  coord_fixed() +
+  theme_minimal() +
+  labs(x = "Colonne", y = "Ligne")
+
+# Affichage
+parcelle_plot
+
+```
+
+
+## Plan illustration voisins
+
+```{r}
+
+# --- Graphique plan de la parcelle ---
+parcelle_plot <- ggplot() +
+  # Blocs colorés
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = bloc_type),
+    color = "black"
+  ) +
+
+  # Grande route horizontale
+  geom_segment(
+    data = filter(data_rect, row_num == 5),
+    aes(x = xmin, xend = xmax,
+        y = row_num + 0.5, yend = row_num + 0.5,
+        color = "Grande route"),
+    linewidth = 2
+  ) +
+
+  # Routes verticales
+  {
+    route_cols <- c("F", "B", "C", "D", "E")
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      x_mid <- x_max[i]
+      data.frame(x = x_mid)
+    }) %>% bind_rows()
+
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+
+  # Palette couleurs blocs
+  scale_fill_manual(
+    values = c(
+      "Bloc central" = "red",
+      "Bloc voisins" = "orange",
+      "Autre" = "white"
+    ),
+    name = "Type de bloc",
+    breaks = c("Bloc central", "Bloc voisins")
+  ) +
+
+  # Couleurs routes
+  scale_color_manual(
+    name = "",
+    values = c("Grande route" = "black", "Route moyenne" = "black")
+  ) +
+
+  # Guides légende routes
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        linewidth = c(2, 1.1),
+        color = c("black", "black")
+      )
+    )
+  ) +
+
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",
+    expand = c(0, 0)
+  ) +
+
+  coord_fixed() +
+  theme_minimal() +
+  labs(x = "Colonne", y = "Ligne") +
+
+  # --- Texte dans les blocs voisins + central ---
+  geom_text(
+    data = filter(data_rect, bloc_nom != ""),
+    aes(
+      x = (xmin + xmax)/2,
+      y = (ymin + ymax)/2,
+      label = bloc_nom
+    ),
+    size = 3
+  )
+
+# Affichage
+parcelle_plot
+
+```
+
+# Heatmaps
+
+## Ponctuel
+
+```{r}
+
+# Joindre les coordonnées continues et inverser l'ordre des colonnes
+data_rect <- Infection_Table %>%
+  mutate(colonne = factor(colonne, levels = rev(levels(colonne)))) %>%  # forcer l'ordre inversé pour l'affichage
+  left_join(col_coords, by = "colonne") %>%
+  mutate(
+    row_num = as.numeric(ligne),  # numéro de ligne pour l'axe y
+    ymin = row_num - 0.5,         # bord inférieur du bloc
+    ymax = row_num + 0.5          # bord supérieur du bloc
+  )
+
+
+# --- construction du graphique heatmap ---
+heatmap_plot <- ggplot() +
+  
+  # Blocs colorés selon le nombre de malades détectés (Nb_malades_dens)
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Nb_malades_dens),
+    color = "black"  # contour noir des blocs
+  ) +
+
+  # Labels des valeurs de malades dans chaque bloc
+  geom_text(
+    data = data_rect,
+    aes(x = x_center, y = row_num, label = Nb_malades_dens),
+    color = "black",
+    size = 3
+  ) +
+
+  # Grande route horizontale (ligne 5)
+  geom_segment(
+    data = filter(data_rect, row_num == 5),
+    aes(x = xmin, xend = xmax,
+        y = row_num + 0.5, yend = row_num + 0.5,
+        color = "Grande route"),
+    linewidth = 2
+  ) +
+
+  # Routes verticales entre certaines colonnes
+  {
+    route_cols <- c("F","B", "C", "D", "E")
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      x_mid <- x_max[i]
+      data.frame(x = x_mid)
+    }) %>% bind_rows()
+
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+
+  # Dégradé de couleurs pour le nombre de malades
+  scale_fill_continuous(low = "grey", high = "red", trans = "log10") +
+  
+  # Couleurs fixes pour les routes
+  scale_color_manual(name = "", values = c("Grande route" = "black", "Route moyenne" = "black")) +
+
+  # Guides / légendes
+  guides(
+    fill = guide_colorbar(order = 1),  # dégradé des malades en premier
+    color = guide_legend(               # légende des routes en second
+      order = 2,
+      override.aes = list(
+        linewidth = c(2, 1.1),
+        color = c("black", "black")
+      )
+    )
+  ) +
+
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",  # inverser l'axe y pour que ligne 1 soit en haut
+    expand = c(0, 0)
+  ) +
+
+  # Fixer les proportions des blocs pour avoir des carrés
+  coord_fixed() +
+  theme_minimal() +
+  labs(
+    title = "Évolution du nombre de malades détecté dans le temps", 
+    x = "Colonne", y = "Ligne", fill = "Nombre de malades/ha"
+  ) +
+
+  # Animation par semaine
+  transition_manual(Semaine_label) +  # change la frame à chaque semaine
+  labs(subtitle = "Semaine : {current_frame}") +
+  ease_aes("linear")  # interpolation linéaire entre les frames
+
+# --- Animation ---
+# animate(heatmap_plot, nframes=103, duration = 100, renderer = av_renderer("heatmap_Infection_Table_ponctuel.mp4"))
+animate(heatmap_plot, nframes = 103, duration = 100)  
+# La fonction `animate()` génère l'animation en mémoire et l'affiche directement dans R.
+# Si on utilise `renderer = av_renderer(...)`, on peut sauvegarder l'animation directement en MP4.
+# Ici, on commente le rendu en fichier pour juste visualiser l'animation dans R.
+
+
+```
+
+## Cumul
+
+```{r}
+# --- Heatmap des malades cumulés ---
+heatmap_plot <- ggplot() +
+
+  # Blocs colorés selon le nombre cumulé de malades (Nb_malades_cumule_dens)
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = Nb_malades_cumule_dens),
+    color = "black"  # contour noir
+  ) +
+
+  # Labels des valeurs cumulées à l'intérieur des blocs
+  geom_text(
+    data = data_rect,
+    aes(x = x_center, y = row_num, label = Nb_malades_cumule_dens),
+    color = "black",
+    size = 3
+  ) +
+
+  # Grande route horizontale (ligne 5)
+  geom_segment(
+    data = filter(data_rect, row_num == 5),
+    aes(x = xmin, xend = xmax,
+        y = row_num + 0.5, yend = row_num + 0.5,
+        color = "Grande route"),
+    linewidth = 2
+  ) +
+
+  # Routes verticales entre certaines colonnes
+  {
+    route_cols <- c("F","B", "C", "D", "E")
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      x_mid <- x_max[i]
+      data.frame(x = x_mid)
+    }) %>% bind_rows()
+
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+
+  # Dégradé de couleurs pour les valeurs cumulées
+  scale_fill_continuous(low = "grey", high = "red", trans = "log10") +
+
+  # Couleurs fixes pour les routes
+  scale_color_manual(name = "", values = c("Grande route" = "black", "Route moyenne" = "black")) +
+
+  # Guides / légendes
+  guides(
+    fill = guide_colorbar(order = 1),         # dégradé pour le remplissage
+    color = guide_legend(                     # légende des routes
+      order = 2,
+      override.aes = list(
+        linewidth = c(2, 1.1),
+        color = c("black", "black")
+      )
+    )
+  ) +
+
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",  # inverser l'axe y pour que ligne 1 soit en haut
+    expand = c(0, 0)
+  ) +
+
+  # Fixer le ratio pour avoir des carrés
+  coord_fixed() +
+  theme_minimal() +
+  labs(
+    title = "Evolution du nombre de malades cumulé dans le temps", 
+    x = "Colonne", y = "Ligne", fill = "Nombre de malades/ha"
+  ) +
+
+  # Animation par semaine
+  transition_manual(Semaine_label) +       # chaque frame = une semaine
+  labs(subtitle = "Semaine : {current_frame}") +
+  ease_aes("linear")                       # transitions linéaires
+
+# --- Animation ---
+# animate(heatmap_plot, nframes=103, duration = 100, renderer = av_renderer("heatmap_Infection_Table_cumule.mp4"))
+animate(heatmap_plot, nframes = 103, duration = 100)  
+# La fonction animate() produit l'animation en mémoire et l'affiche dans R.
+# Si on décommente la ligne avec av_renderer, l'animation est sauvegardée directement en MP4.
+# Le paramètre nframes = 103 correspond au nombre de semaines suivies, duration = 100 fixe la durée totale en secondes.
+
+
+```
+
+
+
+
+# Quelques statistiques sur les données ponctuelles
+
+```{r}
+
+# Proportion de blocs sans malades
+Infection_Table %>%
+  summarise(proportion_zero = mean(Nb_malades_dens == 0))
+
+
+# Proportion de zéros par année
+Infection_Table %>%
+  group_by(Year) %>%
+  summarise(proportion_zero = mean(Nb_malades_dens == 0))
+
+
+# Résumé statistique par année
+resume_par_annee <- Infection_Table %>%
+  group_by(Year) %>%
+  summarise(
+    moyenne = mean(Nb_malades_dens, na.rm = TRUE),
+    ecart_type = sd(Nb_malades_dens, na.rm = TRUE),
+    mediane = median(Nb_malades_dens, na.rm = TRUE),
+    Q1 = quantile(Nb_malades_dens, 0.25, na.rm = TRUE),
+    Q3 = quantile(Nb_malades_dens, 0.75, na.rm = TRUE),
+    max = max(Nb_malades_dens, na.rm = TRUE)
+  )
+
+print(resume_par_annee)
+
+```
+
+
+
+
+
+
+
+# Quelques statistiques sur les données cumulées
+
+
+
+
+
+```{r}
+# Graphique 1 : toutes les courbes en gris
+ggplot(Infection_Table, aes(x = Date, y = Nb_malades_cumule_dens, group = Bloc)) + 
+  geom_line(color = "grey") +  
+  labs(
+    title = "Évolution du nombre de malades cumulé par blocs en fonction du temps",
+    x = "Temps",
+    y = "Nombre de malades/ha"
+  ) +  
+  theme_minimal()
+
+
+# Graphique 2 : C1 en rouge, autres en gris
+ggplot(Infection_Table, aes(x = Date, y = Nb_malades_cumule_dens, 
+                            group = Bloc, color  = Bloc == "C1")) + 
+  geom_line() +  
+  labs(
+    title = "Évolution du nombre de malades cumulé par blocs en fonction du temps",
+    x = "Temps",
+    y = "Nombre de malades/ha",
+    color = "C1"
+  ) + 
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey")) +  
+  theme_minimal()
+
+
+# Graphique 3 : plusieurs blocs en rouge, autres en gris
+ggplot(Infection_Table, aes(x = Date, y = Nb_malades_cumule_dens, 
+                            group = Bloc, color  = Bloc %in% c("C1", "A1", "F10", "E1"))) + 
+  geom_line() +  
+  labs(
+    title = "Évolution du nombre de malades cumulé par blocs en fonction du temps",
+    x = "Temps",
+    y = "Nombre de malades/ha",
+    color = "C1, A1, F10, E1"
+  ) + 
+  scale_color_manual(values = c("TRUE" = "red", "FALSE" = "grey")) +  
+  theme_minimal()
+
+
+# Préparation : variable "Suivi" pour C1 et A5
+Infection_Table <- Infection_Table %>%
+  mutate(
+    Suivi = factor(
+      ifelse(Bloc %in% c("C1", "A5"), 
+             "Premiers blocs infectés (C1 et A5)", 
+             "Autres blocs"),
+      levels = c("Premiers blocs infectés (C1 et A5)", "Autres blocs")
+    )
+  )
+
+# Graphique 4 : C1 et A5 en trait plein, autres en pointillés, couleur = distance
+ggplot(Infection_Table, aes(x = Date, y = Nb_malades_cumule_dens, 
+                            group = Bloc, 
+                            color = distance_totale, 
+                            linetype = Suivi)) + 
+  geom_line(aes(size = Suivi)) +   
+  labs(
+    title = "Évolution du nombre de malades cumulé par blocs en fonction du temps",
+    x = "Temps",
+    y = "Nombre de plants malades/ha",
+    color = "Distance euclidienne des blocs à C1",
+    linetype = ""
+  ) +
+  scale_color_gradientn(colors = c("red", "chartreuse3", "cyan2")) +
+  scale_linetype_manual(
+    values = c("Autres blocs" = "dashed",
+               "Premiers blocs infectés (C1 et A5)" = "solid")
+  ) +
+  scale_size_manual(
+    values = c("Autres blocs" = 0.5, 
+               "Premiers blocs infectés (C1 et A5)" = 1.2),
+    guide = "none"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+# Données climatiques de la parcelle visualisation par semaine
+
+```{r}
+vtp <- vtp %>%
+    mutate(ISO_semaine = paste0(as.character(iso_week), "-1"))
+vtp$ISO_semaine=as.factor(vtp$ISO_semaine)
+
+vtp$Date_semaine<-ISOweek2date(vtp$ISO_semaine)
+```
+
+
+
+```{r}
+
+
+# Fonction pour la métrique choisie (ici moyenne)
+semaines_uniques <- sort(unique(vtp$Date_semaine))
+
+# Calcul glissant sur données journalières
+vtp_weekly <- map_dfr(semaines_uniques, function(w) {
+  indices <- vtp$Date_semaine == w
+  temp_w <- vtp$Température[indices]
+  pluie_w <- vtp$precipitation[indices]
+  
+  tibble(
+    Date_semaine = w,  # on garde directement la date
+    temp_moyenne = mean(temp_w - 273, na.rm = TRUE),
+    pluie_moyenne = mean(pluie_w, na.rm = TRUE),
+  )
+})
+
+date_cible <- ISOweek2date("2014-W20-1")  # lundi semaine 20 2014
+
+# Graphique Température
+ggplot(vtp_weekly, aes(x = Date_semaine , y = temp_moyenne)) +
+  geom_line(color = "red", size = 1) +
+  geom_point(color = "red", size = 1.5) +
+  labs(
+    title = "(a)",
+    x = "Date",
+    y = "Température (°C)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) +
+  geom_vline(
+    xintercept = as.numeric(date_cible),  # position verticale
+    color = "black",
+    size = 1,          # épaisseur du trait
+    linetype = "dashed" # optionnel : style du trait
+  ) +
+  annotate(
+    "text",
+    x = date_cible,
+    y = max(vtp_weekly$temp_moyenne, na.rm = TRUE) + 1,  # au-dessus du graphique
+    label = "Début suivi",
+    angle = 90,
+    vjust = -0.5,
+    hjust = 2
+  )
+
+
+# Graphique Pluie
+ggplot(vtp_weekly, aes(x = Date_semaine, y = pluie_moyenne)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "blue", size = 1.5) +
+  labs(
+    title = "(b)",
+    x = "Date",
+    y = "Moyenne des précipitations quotidiennes (mm/jour)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) +
+  geom_vline(
+    xintercept = as.numeric(date_cible),
+    color = "black",
+    size = 1,
+    linetype = "dashed"
+  ) +
+  annotate(
+    "text",
+    x = date_cible,
+    y = max(vtp_weekly$pluie_moyenne, na.rm = TRUE) + 1,  # au-dessus du graphique
+    label = "Début suivi",
+    angle = 90,
+    vjust = -0.5,
+    hjust = 2
+  )
+
+
+
+```
+
+
+
+
+
+
+
+
