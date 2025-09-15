@@ -12,7 +12,7 @@ L’approche combine :
 
 Le schéma ci-dessous illustre la structure des fichiers et des données utilisées dans l’analyse :  
 
-<img width="880" height="542" alt="schema" src="https://github.com/user-attachments/assets/2cce340a-d118-4a9f-99fd-bcbc2d087185" />
+<img width="870" height="555" alt="schema" src="https://github.com/user-attachments/assets/e27d86b0-b004-48d4-abb3-35833e40b4db" />
 
 # Version de R et packages principaux
 
