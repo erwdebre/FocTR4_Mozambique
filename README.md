@@ -16,11 +16,12 @@ Le schéma ci-dessous illustre la structure des fichiers et des données utilis�
 
 # Version de R et packages principaux
 
-- **R version** : indiquer la version utilisée (ex. `R 4.3.1`)  
+- **R version** : 4.5.0  
 - **Packages essentiels** :  
-  - `refund` : pour l’analyse en composantes principales fonctionnelles (FPCA).  
-  - `ranger` : forêts aléatoires rapides avec estimation d’importance de variables.  
-  - `caret` : pour la sélection de variables via RFE et la validation croisée.  
+  - `refund 0.1-37` : analyse en composantes principales fonctionnelles (FPCA).  
+  - `ranger 0.17.0` : forêts aléatoires rapides avec estimation d’importance des variables.  
+  - `caret 7.0-1` : sélection de variables via RFE et validation croisée.  
+  - `ale 0.5.1` : visualisation et interprétation des effets ALE (Accumulated Local Effects).  
 
 
 # Objectif
