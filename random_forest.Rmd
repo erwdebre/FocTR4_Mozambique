@@ -1,0 +1,799 @@
+---
+title: "random forest"
+output: html_document
+date: "2025-07-17"
+---
+
+```{r}
+set.seed(123)
+```
+
+
+# Chargement données et préparations des variables
+
+```{r}
+library(purrr)      # Pour la programmation fonctionnelle et l'application de fonctions sur des listes ou vecteurs (ex: map, map_dfr)
+library(dplyr)      # Pour la manipulation de données : filtres, regroupements, mutations, joins, etc.
+library(tidyr)      # Pour transformer les données entre format long et large (pivot_longer, pivot_wider)
+library(ggplot2)    # Pour la visualisation graphique
+library(caret)      # Pour le machine learning : RFE, entraînement, validation croisée, prétraitement
+library(doParallel) # Pour le parallélisme, utilisé notamment pour accélérer le RFE
+library(ranger)     # Pour construire des forêts aléatoires rapides
+library(vip)        # Pour visualiser l’importance des variables dans les modèles
+library(GGally)     # Pour les graphiques avancés type ggpairs (scatterplots + corrélations + distributions)
+library(stringr)    # Pour la manipulation de chaînes de caractères (extraction, remplacement)
+library(ale)        # Pour calculer les ALE (Accumulated Local Effects) sur un modèle
+library(corrplot)   # Pour visualiser des matrices de corrélation
+
+# Chargement des données
+load("vtp.RData") # Charge un objet RData nommé vtp
+
+# Lecture du tableau d’infection
+Infection_Table = read.csv("Infection_Table_clean.csv", stringsAsFactors = TRUE)
+
+# Conversion de la colonne iso_week en facteur
+vtp$iso_week = as.factor(vtp$iso_week)
+
+# Renommage pour plus de clarté
+vtp <- vtp %>%
+  dplyr::rename(ISO_semaine = iso_week)
+
+# Conversion de la colonne Bloc en facteur (si ce n'était pas déjà le cas)
+Infection_Table$Bloc = as.factor(as.character(Infection_Table$Bloc))
+```
+
+
+
+```{r}
+
+# --- Création de nouvelles variables dans Infection_Table ---
+Infection_Table$delta    <- Infection_Table$Nb_malades_dens          # variable de malades densité
+Infection_Table$cumudelta <- Infection_Table$Nb_malades_cumule_dens  # cumul des malades
+
+# --- Calcul hebdomadaire des températures et précipitations ---
+seuil_pluie <- quantile(vtp$precipitation, 0.9)                       # seuil pluie 90%
+semaines_uniques <- sort(unique(as.numeric(vtp$ISO_semaine)))
+
+# Agrégation hebdomadaire et création de variables indicatrices
+vtp_weekly <- map_dfr(semaines_uniques, function(w) {
+  indices <- as.numeric(vtp$ISO_semaine) == w
+  temp_w <- vtp$Température[indices]
+  pluie_w <- vtp$precipitation[indices]
+  
+  tibble(
+    ISO_semaine = w,
+    temp_moyenne = mean(temp_w - 273, na.rm = TRUE),
+    pluie_moyenne = mean(pluie_w, na.rm = TRUE),
+    nb_pluie_seuil_90 = sum(pluie_w >= seuil_pluie) > 0,
+    temp_seuil_25_28 = mean(temp_w - 273, na.rm = TRUE) >= 25 &
+                        mean(temp_w - 273, na.rm = TRUE) <= 28
+  )
+})
+
+vtp_weekly$nb_pluie_seuil_90 <- as.factor(vtp_weekly$nb_pluie_seuil_90)
+
+# --- Fonctions utilitaires ---
+# 1. get_lag_matrix : créer des variables décalées (lags)
+# --- Fonction pour générer des lags d'une variable ---
+get_lag_matrix <- function(vec, prefix, d, k, n_rows = 103) {
+  # vec    : vecteur de données (numérique, facteur, etc.)
+  # prefix : nom de base pour les colonnes de sortie
+  # d, k   : indices de début et fin pour les lags (ex : lag0 à lag9)
+  # n_rows : nombre de lignes finales à conserver (taille du dataset final)
+  
+  # Créer une matrice contenant les lags
+  lag_mat <- sapply(d:k, function(l) {
+    # Décalage de 'l' périodes en arrière
+    tail(dplyr::lag(vec, l), n_rows)
+  })
+  
+  # Nommer les colonnes selon le pattern : prefix_lagd à prefix_lagk
+  colnames(lag_mat) <- paste0(prefix, "_lag", d:k)
+  
+  # Conversion en data.frame
+  lag_df <- as.data.frame(lag_mat)
+  
+  # Si vecteur initial non numérique → convertir chaque colonne en facteur
+  if (is.character(vec) || is.factor(vec) || is.logical(vec)) {
+    lag_df <- dplyr::mutate_all(lag_df, as.factor)
+  }
+  
+  return(lag_df)
+}
+
+# 2. moyenne_par_Ccols : calculer des moyennes glissantes sur groupes de colonnes (ex: 2 semaines)
+# Ces fonctions permettent de générer des features temporelles à partir des données météo
+# --- Fonction pour calculer des moyennes glissantes par groupe de colonnes ---
+moyenne_par_Ccols <- function(df, pref, C) {
+  # df   : data.frame contenant des colonnes de lags (ex: "pluie_lag0", "pluie_lag1", ...)
+  # pref : préfixe du nom des colonnes (ex: "pluie_moyenne")
+  # C    : nombre de colonnes à regrouper pour calculer la moyenne
+  
+  col_names <- colnames(df)
+  n <- length(col_names)
+  
+  # Identifier les groupes de colonnes (chaque groupe contient C colonnes)
+  group_indices <- ceiling(seq_along(col_names) / C)
+  
+  # Calcul de la moyenne par groupe
+  map_dfc(unique(group_indices), function(g) {
+    cols_group <- col_names[group_indices == g]
+    
+    # Extraire les numéros de lag depuis les noms (ex: "pluie_lag5" → 5)
+    lags <- str_extract(cols_group, "\\d+") %>% as.integer()
+    
+    # Nommer la colonne résultat (ex: "moyenne_lag_pluie_moyenne0_1")
+    nom_col <- paste0("moyenne_lag_", pref, min(lags), "_", max(lags))
+    
+    df %>%
+      dplyr::select(all_of(cols_group)) %>%
+      dplyr::transmute(!!nom_col := rowMeans(., na.rm = TRUE))
+  })
+}
+
+# --- Génération des lags pour température et pluie ---
+temp_lag_df   <- get_lag_matrix(vtp_weekly$temp_moyenne, "temp_moyenne", 0, 9)
+pluie_lag_df  <- get_lag_matrix(vtp_weekly$pluie_moyenne, "pluie_moyenne", 0, 9)
+pluie_lag_df_5_15 <- get_lag_matrix(vtp_weekly$pluie_moyenne, "pluie_moyenne", 6, 15)
+nb_pluie_seuil_90lag_df <- get_lag_matrix(vtp_weekly$nb_pluie_seuil_90, "nb_pluie_seuil90", 2, 9)
+temp_seuil_25_28lag_df <- get_lag_matrix(vtp_weekly$temp_seuil_25_28, "temp_seuil_25_28", 0, 9)
+
+# Moyennes glissantes sur blocs de lags
+temp_moyenne_2sem_df  <- moyenne_par_Ccols(temp_lag_df, "temp_moyenne", 2)
+pluie_moyenne_2sem_df <- moyenne_par_Ccols(pluie_lag_df, "pluie_moyenne", 2)
+pluie_moyenne_5sem_df <- moyenne_par_Ccols(pluie_lag_df_5_15, "pluie_moyenne", 5)
+
+# Ajout de la colonne semaine pour faire des jointures plus tard
+for(df in list(temp_lag_df, temp_moyenne_2sem_df, pluie_lag_df, 
+               pluie_moyenne_2sem_df, pluie_moyenne_5sem_df,
+               nb_pluie_seuil_90lag_df, temp_seuil_25_28lag_df)) {
+  df$semaine <- 1:103
+}
+
+# --- Préparation d’Infection_Table pour les voisins et cumul ---
+Infection_Table$Week <- as.numeric(as.factor(Infection_Table$ISO_semaine))
+Infection_Table$colonne <- as.numeric(Infection_Table$colonne)
+
+# Création des colonnes pour les voisins
+Infection_Table$haut <- NA_real_
+Infection_Table$bas <- NA_real_
+Infection_Table$gauche <- NA_real_
+Infection_Table$droite <- NA_real_
+Infection_Table$cumult <- NA_real_
+
+# Index rapide pour accès aux cumuls
+index <- Infection_Table %>% dplyr::select(ligne, colonne, Week, cumudelta)
+
+# Boucle pour remplir les valeurs des voisins et du bloc lui-même
+for (i in 1:nrow(Infection_Table)) {
+  ligne_i <- Infection_Table$ligne[i]
+  colonne_i <- Infection_Table$colonne[i]
+  week_i <- Infection_Table$Week[i]
+
+  get_voisin_value <- function(l, c) {
+    v <- index %>% dplyr::filter(ligne == l, colonne == c, Week == week_i)
+    if (nrow(v) > 0) v$cumudelta else 0
+  }
+
+  Infection_Table$haut[i]   <- get_voisin_value(ligne_i - 1, colonne_i)
+  Infection_Table$bas[i]    <- get_voisin_value(ligne_i + 1, colonne_i)
+  Infection_Table$gauche[i] <- get_voisin_value(ligne_i, colonne_i + 1)
+  Infection_Table$droite[i] <- get_voisin_value(ligne_i, colonne_i - 1)
+  Infection_Table$cumult[i] <- get_voisin_value(ligne_i, colonne_i)
+}
+
+# Recréation de la variable semaine numérique
+Infection_Table$semaine <- as.numeric(as.factor(Infection_Table$ISO_semaine))
+
+# Sélection des variables pour le modèle final
+data_model <- Infection_Table %>%
+  dplyr::select(Bloc, semaine, delta, haut, bas, gauche, droite, cumult) %>%
+  dplyr::filter(!(Bloc %in% c("C1", "A5")))
+
+pluie_moyenne_2sem_df$semaine <-1:103
+temp_lag_df$semaine <-1:103
+temp_moyenne_2sem_df$semaine <-1:103
+pluie_lag_df$semaine <-1:103
+pluie_moyenne_5sem_df$semaine<-1:103
+nb_pluie_seuil_90lag_df$semaine<-1:103
+temp_seuil_25_28lag_df$semaine<-1:103
+
+# --- Jointure avec les lags météo pour créer le dataset final d’apprentissage ---
+data_model <- data_model %>%
+  dplyr::left_join(temp_lag_df, by = "semaine") %>%
+  dplyr::left_join(pluie_lag_df, by = "semaine") %>%
+  dplyr::left_join(pluie_moyenne_5sem_df, by = "semaine") %>%
+  dplyr::left_join(temp_moyenne_2sem_df, by = "semaine") %>%
+  dplyr::left_join(pluie_moyenne_2sem_df, by = "semaine") %>%
+  dplyr::left_join(nb_pluie_seuil_90lag_df, by = "semaine") %>%
+  dplyr::left_join(temp_seuil_25_28lag_df, by = "semaine")
+
+# Création du dataset final sans colonnes non prédictives
+data_ml <- data_model %>% dplyr::select(-semaine, -Bloc)
+
+# Vérification rapide
+summary(data_ml)
+
+```
+
+
+
+# random forest 
+
+## RFE
+
+
+```{r, eval=FALSE}
+
+# --- RFE avec Random Forest (ranger) personnalisé ---
+
+# Définition de la liste de fonctions pour rfeControl
+ranger_perm <- list(
+  summary = defaultSummary,  # fonction pour résumer la performance (caret)
+  
+  fit = function(x, y, first, last, ...) {
+    # Ajuste un modèle Ranger (Random Forest) avec importance par permutation
+    loadNamespace("ranger")  # s'assurer que le package est chargé
+    data <- data.frame(cbind(x, y))
+    ranger::ranger(
+      y ~ ., 
+      data = data,
+      oob.error = TRUE,
+      seed = 1,
+      importance = "permutation"
+    )
+  },
+  
+  pred = function(object, x) {
+    # Fonction de prédiction pour caret / RFE
+    predict(object, data = x)$predictions
+  },
+  
+  rank = function(object, x, y) {
+    # Classement des variables selon l'importance
+    vimp <- data.frame(Overall = object$variable.importance)
+    
+    if (is.factor(y)) {
+      if (all(levels(y) %in% colnames(vimp))) {
+        avImp <- apply(vimp[, levels(y), drop = TRUE], 1, mean)
+        vimp$Overall <- avImp
+      }
+    }
+    
+    # Tri décroissant
+    vimp <- vimp[order(vimp$Overall, decreasing = TRUE), , drop = FALSE]
+    
+    # Ajouter le nom des variables
+    if (ncol(x) == 1) vimp$var <- colnames(x) else vimp$var <- rownames(vimp)
+    
+    vimp
+  },
+  
+  selectSize = pickSizeBest,  # méthode caret pour choisir le nombre optimal de variables
+  selectVar  = pickVars       # méthode caret pour choisir les variables
+)
+
+# --- Option pour lancer ou non le RFE ---
+run_rfe <- FALSE
+
+if (run_rfe) {
+  # Parallélisation avec doParallel
+  nb_cores <- 16
+  cl <- makeCluster(nb_cores)
+  registerDoParallel(cl)
+  
+  rfe_control <- rfeControl(
+    functions = ranger_perm,
+    method = "repeatedcv",  # validation croisée répétée
+    repeats = 200,
+    number = 5,             # nombre de folds
+    verbose = FALSE,
+    allowParallel = TRUE
+  )
+  
+  set.seed(42)
+  rfe_result <- rfe(
+    x = data_ml %>% dplyr::select(-delta),
+    y = data_ml$delta,
+    sizes = 1:(ncol(data_ml) - 1),
+    rfeControl = rfe_control
+  )
+  
+  # Arrêt du cluster parallèle
+  stopCluster(cl)
+  registerDoSEQ()
+  
+  # Sauvegarde des résultats
+  save(rfe_result, file = "rfe_result.RData")
+}
+
+
+```
+
+
+
+
+
+```{r}
+# --- Chargement du résultat du RFE et affichage des variables sélectionnées ---
+
+# Charger le fichier RData contenant l'objet 'rfe_result' issu du RFE
+load(file = "rfe_result_bloc5.RDATA")
+
+# Extraire les variables sélectionnées par le RFE
+selected_vars <- predictors(rfe_result)
+
+# Afficher le résultat
+cat("Variables sélectionnées par RFE :\n")
+print(selected_vars)
+
+```
+`
+
+
+```{r}
+# --- Visualisation de la performance RFE avec intervalle de confiance ---
+
+# Récupérer les résultats du RFE
+perf <- rfe_result$results
+
+# Définir le nombre de folds et de répétitions
+cv <- 5
+rep <- 200
+n <- cv * rep  # nombre total de répétitions pour l'IC
+
+# Calcul des intervalles de confiance à 95% pour le RMSE
+perf$RMSE_lower <- perf$RMSE - 1.96 * perf$RMSESD / sqrt(n)
+perf$RMSE_upper <- perf$RMSE + 1.96 * perf$RMSESD / sqrt(n)
+
+# Nombre de variables choisi pour illustrer (ici 15)
+nb_sel <- 15
+rmse_sel <- perf$RMSE[perf$Variables == nb_sel]
+
+# Graphique RMSE selon le nombre de variables sélectionnées
+ggplot(perf, aes(x = Variables, y = RMSE)) +
+  geom_line() +  # courbe RMSE
+  geom_point() + # points RMSE
+  geom_errorbar(aes(ymin = RMSE_lower, ymax = RMSE_upper), width = 0.2) + # IC
+  labs(y = "RMSE", x = "Nombre de variables") +
+  theme_minimal() +
+  
+  # Flèche rouge pour indiquer le nombre de variables choisi
+  annotate(
+    "segment",
+    x = nb_sel + 3, xend = nb_sel,
+    y = rmse_sel + 0.025, yend = rmse_sel,
+    colour = "red",
+    arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+    size = 0.7
+  ) +
+  
+  # Texte explicatif associé à la flèche
+  annotate(
+    "text",
+    x = nb_sel + 3, 
+    y = rmse_sel + 0.03,
+    label = "Nombre de variables choisi",
+    colour = "red",
+    hjust = 0  # alignement gauche
+  )
+
+
+
+```
+
+
+## Corrélations et relations entre variables sélectionnées
+
+```{r,fig.height=10}
+# --- Préparation du corrplot avec noms explicites pour les variables ---
+
+# Dictionnaire de renommage : noms explicites pour le graphique
+rename_dict <- c(
+  cumult = "Cumul bloc lui même semaine -1",
+  gauche = "Cumul à gauche semaine -1",
+  bas = "Cumul en bas semaine -1",
+  haut = "Cumul en haut semaine -1",
+  droite = "Cumul à droite semaine -1",
+  
+  moyenne_lag_temp_moyenne6_7 = "Moyenne température semaine -6 à -7",
+  moyenne_lag_temp_moyenne4_5 = "Moyenne température semaine -4 à -5",
+  moyenne_lag_temp_moyenne8_9 = "Moyenne température semaine -8 à -9",
+  temp_moyenne_lag7 = "Moyenne température semaine -7",
+  temp_moyenne_lag2 = "Moyenne température semaine -2",
+  
+  moyenne_lag_pluie_moyenne4_5 = "Moyenne pluie semaine -4 à -5",
+  moyenne_lag_pluie_moyenne2_3 = "Moyenne pluie semaine -2 à -3",
+  moyenne_lag_pluie_moyenne6_10 = "Moyenne pluie semaine -6 à -10",
+  moyenne_lag_pluie_moyenne0_1 = "Moyenne pluie semaine actuelle à -1",
+  pluie_moyenne_lag0 = "Moyenne pluie semaine actuelle"
+)
+
+# Calcul de la matrice de corrélation pour les 15 variables sélectionnées
+corr_matrix <- cor(data_ml[, selected_vars[1:15]])
+
+# Renommage des lignes et colonnes pour le corrplot
+var_names <- colnames(corr_matrix)
+renamed_vars <- rename_dict[var_names]  # récupération des noms explicites
+names(renamed_vars) <- var_names        # sécurité pour mapping exact
+
+colnames(corr_matrix) <- renamed_vars
+rownames(corr_matrix) <- renamed_vars
+
+# On peut filtrer les corrélations faibles si besoin (ici toutes conservées)
+corr_filtered <- corr_matrix
+
+# Affichage du corrplot
+corrplot(
+  corr_filtered,
+  type = "lower",        # partie inférieure de la matrice
+  method = "color",      # couleurs pour la force de corrélation
+  addCoef.col = "black", # afficher la valeur des corrélations
+  number.cex = 0.8,      # taille du texte
+  tl.col = "black",      # couleur des labels
+  na.label = " "         # vide pour valeurs manquantes
+)
+
+
+```
+
+
+
+```{r,fig.height=20,fig.width=20, message=FALSE, warning=FALSE}
+# --- Sélection et renommage des variables pour le plot ggpairs ---
+
+# Extraire les 15 variables sélectionnées par RFE
+df_sub <- data_ml[, selected_vars[1:15]]
+
+# Renommer les colonnes avec des noms explicites
+colnames(df_sub) <- rename_dict[colnames(df_sub)]
+
+# Création de la matrice de plots (ggpairs)
+# Affiche : distribution de chaque variable, scatterplots et corrélations
+ggpairs(
+  df_sub,
+  columnLabels = colnames(df_sub),  # noms explicites affichés
+  axisLabels = "show"               # afficher labels axes
+) +
+  theme_minimal() +
+  theme(
+    strip.text.x = element_text(size = 15, angle = 90, hjust = 0), # labels en haut
+    strip.text.y = element_text(size = 15, angle = 0, hjust = 0)   # labels sur côté
+  )
+
+
+
+```
+
+
+```{r,,fig.height=10,fig.width=10, message=FALSE, warning=FALSE}
+# Extraire les colonnes concernées
+corr_matrix <- cor(data_ml[, c("cumult","haut","droite","moyenne_lag_pluie_moyenne4_5","moyenne_lag_temp_moyenne6_7" ,"moyenne_lag_pluie_moyenne2_3","pluie_moyenne_lag0","moyenne_lag_pluie_moyenne6_10")], use = "pairwise.complete.obs")
+
+# Renommage des lignes/colonnes de la matrice de corrélation
+var_names <- colnames(corr_matrix)
+renamed_vars <- rename_dict[var_names]
+names(renamed_vars) <- var_names  
+
+# Appliquer les nouveaux noms aux lignes/colonnes
+colnames(corr_matrix) <- renamed_vars
+rownames(corr_matrix) <- renamed_vars
+
+# Masquer les corrélations faibles
+corr_filtered <- corr_matrix
+
+
+# Afficher le corrplot avec uniquement les corrélations > 0.7
+corrplot(corr_filtered,
+         type = "lower",
+         method = "color",
+         addCoef.col = "black",
+         number.cex = 0.8,
+         tl.col = "black",
+         na.label = " ")
+```
+
+
+
+## Modélisation ALE
+
+
+```{r}
+# ------------------------------
+# 1. Dictionnaire pour renommer les variables
+# ------------------------------
+rename_dict <- c(
+  cumult = "Cumul sur le bloc semaine lag 1",
+  haut = "Cumul en haut semaine lag 1",
+  droite = "Cumul à droite semaine lag 1",
+  moyenne_lag_pluie_moyenne4_5 = "Moyenne pluie semaine lag 4 à 5",
+  moyenne_lag_pluie_moyenne2_3 = "Moyenne pluie semaine lag 2 à 3",
+  pluie_moyenne_lag0 = "Moyenne pluie semaine-même",
+  moyenne_lag_pluie_moyenne6_10 = "Moyenne pluie semaine lag 6 à 10"
+)
+
+# ------------------------------
+# 2. Génération de noms valides pour R
+# ------------------------------
+# make.names transforme les noms pour qu'ils soient valides dans R (points à la place des espaces, caractères spéciaux supprimés)
+clean_names <- make.names(rename_dict, unique = TRUE)
+
+# ------------------------------
+# 3. Renommer les colonnes de data_ml selon le dictionnaire
+# ------------------------------
+data_ml_renamed <- data_ml %>%
+  dplyr::rename(
+    Cumul.sur.le.bloc.semaine.lag.1 = cumult,
+    Cumul.en.haut.semaine.lag.1 = haut,
+    Cumul.à.droite.semaine.lag.1 = droite,
+    Moyenne.pluie.semaine.lag.4.à.5 = moyenne_lag_pluie_moyenne4_5,
+    Moyenne.pluie.semaine.lag.2.à.3 = moyenne_lag_pluie_moyenne2_3,
+    Moyenne.pluie.semaine.même = pluie_moyenne_lag0,
+    Moyenne.pluie.semaine.lag.6.à.10 = moyenne_lag_pluie_moyenne6_10
+  )
+
+# ------------------------------
+# 4. Ajustement d'un modèle de forêt aléatoire (ranger)
+# ------------------------------
+rf_model <- ranger(
+  formula = delta ~ .,                        # variable cible = delta, toutes les autres sont prédicteurs
+  data = data_ml_renamed[, c("delta", clean_names)],  # données avec delta + variables renommées
+  num.trees = 500,                            # nombre d'arbres dans la forêt
+  importance = "permutation",                 # importance des variables par permutation
+  keep.inbag = TRUE                           # conserver les échantillons utilisés dans chaque arbre
+)
+
+# ------------------------------
+# 5. Résumé du modèle
+# ------------------------------
+print(rf_model)  # affiche les détails de la forêt aléatoire
+
+# ------------------------------
+# 6. Importance des variables
+# ------------------------------
+importance_vals <- rf_model$variable.importance
+print(importance_vals)  # affiche les valeurs numériques de l'importance
+
+# ------------------------------
+# 7. Visualisation de l'importance des variables
+# ------------------------------
+vip(rf_model)  # trace un graphique montrant l'importance des variables
+
+```
+
+
+
+```{r}
+
+# Définir une fonction de prédiction compatible ALE pour ranger
+predict_ranger <- function(object, newdata, type = "response") {
+  # ranger attend 'data' au lieu de 'newdata'
+  pred <- predict(object, data = newdata)$predictions
+  return(pred)
+}
+# Créer ALE avec bootstrap
+ale_rf_boot <- ALE(
+  model = rf_model,
+  data = data_ml_renamed[, c("delta",clean_names)],
+  boot_it = 100,       # nombre de bootstrap
+  pred_fun = predict_ranger,   # notre fonction de prédiction
+  output_boot_data = TRUE,
+  pred_type = "response",
+  max_num_bins = 10
+)
+
+```
+
+```{r}
+# ------------------------------
+# 1. Sélection des variables ALE à tracer
+# vars1 : variables “cumul bloc” (3 premières)
+# vars2 : variables “pluie moyenne” (4 dernières)
+# ------------------------------
+vars1 <- clean_names[1:3]
+vars2 <- tail(clean_names, 4)
+
+# ------------------------------
+# 2. Graphique ALE pour vars1 (Cumul Bloc)
+# ------------------------------
+
+# Labels lisibles pour les variables cumul
+var_labels1 <- c(
+  "Cumul.sur.le.bloc.semaine.lag.1" = "lui même semaine -1",
+  "Cumul.en.haut.semaine.lag.1" = "en haut semaine -1",
+  "Cumul.à.droite.semaine.lag.1" = "à droite semaine -1"
+)
+
+# Calcul ALE + intervalles de confiance par bootstrap
+ale_list1 <- lapply(vars1, function(var) {
+  # Récupération des données bootstrap ALE pour la variable
+  ale_boot_data <- get(ale_rf_boot, var, what = "boot_data")
+  
+  # Résumé par niveau de la variable
+  ale_ic <- ale_boot_data %>%
+    dplyr::group_by_at(var) %>%
+    dplyr::summarise(
+      ale_mean = mean(.y),                # effet moyen ALE
+      ic_lower = quantile(.y, 0.025),     # borne inf. IC 95%
+      ic_upper = quantile(.y, 0.975),     # borne sup. IC 95%
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      .x = .data[[var]],                  # valeur de la variable
+      Variables = var_labels1[var]        # label lisible
+    )
+  
+  ale_ic
+})
+
+# Combiner les résultats pour toutes les variables
+ale_df1 <- dplyr::bind_rows(ale_list1)
+
+# Tracer ALE avec intervalle de confiance
+ggplot2::ggplot(ale_df1, ggplot2::aes(x = .x, y = ale_mean, color = Variables, fill = Variables)) +
+  ggplot2::geom_line(linewidth = 1.2) +                       # ligne ALE
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ic_lower, ymax = ic_upper), alpha = 0.2, color = NA) + # IC
+  ggplot2::labs(x = "Nombre de malades par hectare", y = "Effet ALE", color = "Cumul Bloc", fill = "Cumul Bloc") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.box = "horizontal" # légende en ligne
+  )
+
+# ------------------------------
+# 3. Graphique ALE pour vars2 (Pluie moyenne)
+# ------------------------------
+
+# Labels lisibles pour les variables pluie
+var_labels2 <- c(
+  "Moyenne.pluie.semaine.lag.4.à.5" = "Semaine -4 à -5",
+  "Moyenne.pluie.semaine.lag.2.à.3" = "Semaine -2 à -3",
+  "Moyenne.pluie.semaine.même" = "Semaine actuelle",
+  "Moyenne.pluie.semaine.lag.6.à.10" = "Semaine -6 à -10"
+)
+
+# Calcul ALE + IC pour pluie
+ale_list2 <- lapply(vars2, function(var) {
+  ale_boot_data <- get(ale_rf_boot, var, what = "boot_data")
+  
+  ale_ic <- ale_boot_data %>%
+    dplyr::group_by_at(var) %>%
+    dplyr::summarise(
+      ale_mean = mean(.y),
+      ic_lower = quantile(.y, 0.025),
+      ic_upper = quantile(.y, 0.975),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      .x = .data[[var]],
+      Variables = var_labels2[var]
+    )
+  
+  ale_ic
+})
+
+# Combiner les résultats
+ale_df2 <- dplyr::bind_rows(ale_list2)
+
+# Tracer ALE pluie avec IC
+ggplot2::ggplot(ale_df2, ggplot2::aes(x = .x, y = ale_mean, color = Variables, fill = Variables)) +
+  ggplot2::geom_line(linewidth = 1.2) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = ic_lower, ymax = ic_upper), alpha = 0.2, color = NA) +
+  ggplot2::labs(x = "mm/jour moyen sur la période", y = "Effet ALE", color = "Moyenne Pluie", fill = "Moyenne Pluie") +
+  ggplot2::theme_minimal() +
+  ggplot2::theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+```
+
+
+
+
+# Prédictions et validation
+
+```{r}
+# Récupérer semaines uniques triées
+semaines <- sort(unique(data_model$semaine))
+
+# Nombre de semaines
+n_semaines <- length(semaines)
+
+# Découpage 80% / 20% sur les semaines
+n_train <- floor(0.8* n_semaines)
+
+train_semaines <- semaines[1:n_train]
+test_semaines  <- semaines[(n_train + 1):n_semaines]
+
+# Sélection des données
+train_data <- data_model %>% dplyr::filter(semaine %in% train_semaines) %>% dplyr::select(-semaine,-Bloc)
+test_data  <- data_model %>% dplyr::filter(semaine %in% test_semaines)%>% dplyr::select(-semaine,-Bloc)
+
+# Vérifier la taille
+cat("Train size:", nrow(train_data), "\n")
+cat("Test size:", nrow(test_data), "\n")
+```
+
+
+
+```{r}
+# Récupérer semaines uniques triées
+semaines <- sort(unique(data_model$semaine))
+n_semaines <- length(semaines)
+
+# Proportions de train à tester
+train_props <- seq(0.4, 0.98, by = 0.02)  # ex: 50%, 60%, 70%, 80%, 90%
+
+# Dataframe pour stocker résultats
+results <- data.frame()
+
+for (p in train_props) {
+  
+  n_train <- floor(p * n_semaines)
+  train_semaines <- semaines[1:n_train]
+  test_semaines  <- semaines[(n_train + 1):n_semaines]
+  
+  # Sélection des données
+  train_data <- data_model %>%
+    dplyr::filter(semaine %in% train_semaines) %>%
+    dplyr::select(-semaine, -Bloc)
+  test_data <- data_model %>%
+    dplyr::filter(semaine %in% test_semaines) %>%
+    dplyr::select(-semaine, -Bloc)
+  
+  # Ajuster la forêt aléatoire
+  rf_model <- ranger(
+    formula = delta ~ .,         
+    data = train_data[, c("delta",  
+                          "cumult","haut","droite",
+                          "moyenne_lag_pluie_moyenne4_5",
+                          "moyenne_lag_pluie_moyenne2_3",
+                          "pluie_moyenne_lag0",
+                          "moyenne_lag_pluie_moyenne6_10")],  
+    num.trees = 500,             
+    importance = "permutation",    
+    keep.inbag = TRUE
+  )
+  
+  # Prédictions
+  pred_train <- predict(rf_model, data = train_data)$predictions
+  pred_test  <- predict(rf_model, data = test_data)$predictions
+  
+  # R²
+  r2_train <- 1 - sum((train_data$delta - pred_train)^2) / 
+                   sum((train_data$delta - mean(train_data$delta))^2)
+  r2_test <- 1 - sum((test_data$delta - pred_test)^2) / 
+                  sum((test_data$delta - mean(test_data$delta))^2)
+  
+  # RMSE
+  rmse_train <- sqrt(mean((train_data$delta - pred_train)^2))
+  rmse_test  <- sqrt(mean((test_data$delta - pred_test)^2))
+  
+  # Stocker les résultats
+  results <- rbind(results, 
+                   data.frame(train_prop = p, 
+                              R2_train = r2_train, 
+                              R2_test = r2_test,
+                              RMSE_train = rmse_train, 
+                              RMSE_test = rmse_test))
+}
+
+# Transformer en format long pour ggplot
+results_long <- results %>%
+  tidyr::pivot_longer(cols = c(R2_train, R2_test),
+                      names_to = "dataset",
+                      values_to = "R2")
+
+# ---- Graphique R² ----
+ggplot(results_long, aes(x = train_prop, y = R2, color = dataset)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(title = "Évolution du R² selon la taille du jeu d'entraînement",
+       x = "Proportion du jeu d'entraînement",
+       y = "R²") +
+  theme_minimal()
+
+
+```
+
