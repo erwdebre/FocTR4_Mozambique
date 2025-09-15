@@ -1,0 +1,548 @@
+---
+title: "Clustering"
+output: html_document
+date: "2025-04-29"
+---
+
+# Imports et préparation
+
+```{r,warning=FALSE}
+# --- Imports ---
+library(refund)      # Pour l'analyse en composantes principales fonctionnelles (FPCA)
+library(dplyr)       # Manipulation et transformation de données
+library(ggplot2)     # Visualisation
+library(tidyr)       # Transformation données large/long
+library(boot)        # Bootstrap pour intervalles de confiance
+library(factoextra)  # Visualisation et évaluation du clustering
+library(cowplot)     # Combinaison de plusieurs graphiques
+library(dendextend)  # Personnalisation des dendrogrammes
+
+# --- Lecture et préparation de la table d'infection ---
+Infection_Table=read.csv("Infection_Table_clean.csv",stringsAsFactors = T)
+
+# Convertir 'Date' en Date et 'ligne' en facteur
+# Ajouter une colonne 'Route' pour identifier la grande route (ligne 5)
+# Créer un label semaine (ex: "Semaine 01 (2025)") pour affichage
+# Sélectionner uniquement les colonnes nécessaires
+Infection_Table= Infection_Table %>% 
+  mutate(Date=as.Date(Date),
+         ligne=as.factor(ligne)) 
+Infection_Table$Route <- ifelse(Infection_Table$ligne == 5, "Grande route", NA)
+Infection_Table <- Infection_Table %>%
+  mutate(Semaine_label = paste0("Semaine ", sprintf("%02d", Week), " (", Year, ")")) %>%
+  select(Nb_malades_cumule_dens,Bloc,Date)
+
+# Aperçu des données
+summary(Infection_Table)
+
+# --- Passage au format large pour FPCA ---
+# On supprime les blocs "C1" et "A5" (blocs exceptionnels ou manquants)
+# On réorganise par Bloc et Date
+# pivot_wider : chaque ligne = un bloc, chaque colonne = une date
+infection_wide <- Infection_Table%>%
+  filter(!(Bloc %in% c("C1", "A5"))) %>%
+  mutate(Date = as.Date(Date)) %>%
+  arrange(Bloc, Date) %>%
+  pivot_wider(
+    names_from = Date,
+    values_from = Nb_malades_cumule_dens
+  )
+
+# Conversion en matrice pour FPCA (ligne = bloc, colonne = temps)
+Y_mat <- as.matrix(infection_wide[,-1])  
+
+# --- FPCA (Functional Principal Component Analysis) ---
+# On calcule les valeurs lissées Yhat en capturant 98% de la variance
+Wd=fpca.face(Y_mat, center = TRUE,pve=0.98,knots=25)$Yhat
+
+# Attribution des noms de blocs aux lignes
+rownames(Wd) <- infection_wide$Bloc
+
+# Conversion en format long pour ggplot2
+Wd_long  <- as.data.frame(Wd)
+colnames(Wd_long)<- levels(as.factor(Infection_Table$Date))
+Wd_long$Bloc <- rownames(Wd_long)
+Wd_long <- Wd_long  %>%
+  pivot_longer(
+    cols = -Bloc,
+    names_to = "Date",
+    values_to = "fpca"
+  )
+Wd_long$Date=as.Date(Wd_long$Date)
+
+# --- Extraction des scores FPCA ---
+Fit.MM1=fpca.face(Y_mat, center = TRUE,pve=0.98,knots=25)
+
+# Scores des deux premières composantes principales
+X_scores1 <- Fit.MM1$scores %>% 
+  as.data.frame(.) %>%
+  rename("pca_score1"=1, "pca_score2"=2)
+
+# Sélection des colonnes commençant par 'pca_score'
+fpca_scores <- X_scores1 %>% 
+  dplyr::select(starts_with("pca_score"))
+
+# Aperçu des scores
+summary(fpca_scores) # Ces scores ne sont pas centrés ni standardisés
+
+# Conversion finale en data frame pour analyses/clustering
+z_fpca_scores <- fpca_scores %>% as.data.frame(.)
+rownames(z_fpca_scores) <- rownames(Wd)
+
+
+```
+
+
+
+
+
+
+
+# classification hiérarchique
+
+## Nb de clusters
+
+```{r,fig.height=4,fig.width=8,warning=FALSE}
+p1 <- fviz_nbclust(z_fpca_scores, hcut, method = "wss") +
+  ggtitle(label = "", subtitle = "Méthode du coude") +
+  labs(x = "Nombre de clusters", y = "Somme des carrés intra-classe (WSS)") +
+  theme(axis.text.x = element_text(size = 6), 
+        axis.text.y = element_text(size = 6))
+
+p2 <- fviz_nbclust(z_fpca_scores, hcut, method = "silhouette") +
+  ggtitle(label = "", subtitle = "Méthode de la silhouette") +
+  labs(x = "Nombre de clusters", y = "Largeur moyenne de silhouette") +
+  theme(axis.text.x = element_text(size = 6), 
+        axis.text.y = element_text(size = 6))
+
+p3 <- fviz_nbclust(z_fpca_scores, hcut, method = "gap_stat", nstart = 25, nboot = 100, verbose = FALSE) +
+  ggtitle(label = "", subtitle = "Méthode statistique Gap") +
+  labs(x = "Nombre de clusters", y = "Statistique Gap") +
+  theme(axis.text.x = element_text(size = 6), 
+        axis.text.y = element_text(size = 6))
+
+plot_grid(p1, p2, p3, ncol = 3)
+
+
+
+```
+
+
+
+
+## dendogramme
+
+
+
+```{r,warning=FALSE}
+# --- Calcul de la hiérarchie à partir des scores FPCA ---
+# Calcul de la distance entre blocs sur les scores FPCA
+d_fpca <- dist(z_fpca_scores[,])
+
+# Hiérarchie agglomérative avec méthode de Ward (minimisation de la variance intra-classe)
+hc_fpca <- hclust(d_fpca, method = "ward.D2")
+
+# --- Définition des couleurs pour les clusters ---
+# Ici on prévoit 6 couleurs pour la visualisation des branches
+clust.col <- c(
+   "#5DA9E9",  # bleu clair
+   "#14295E",  # bleu foncé
+   "#D73027",  # rouge vif
+   "#FDDE61",  # jaune clair
+   "#FDAE61",  # orange clair
+   "#F46D43"   # orange vif
+)
+
+# --- Conversion en dendrogramme pour personnalisation ---
+hcd <- as.dendrogram(hc_fpca)
+
+# Coloration des branches pour 6 groupes et personnalisation de l'apparence
+hcd <- hcd %>%
+         color_branches(k = 6, col = clust.col) %>%  # couleur des clusters
+         set("branches_lwd", 2) %>%                  # épaisseur des branches
+         set("branches_lty", 1)                      # type de ligne (solide)
+
+# --- Paramètres graphiques ---
+cmar <- c(4, 4, 1, 1)        # marges (bas, gauche, haut, droite)
+par(mar = cmar)
+
+nodePar <- list(lab.cex = 0.6, pch = NA)  # paramètres des noeuds : taille des étiquettes, pas de symbole
+
+# --- Affichage du dendrogramme ---
+plot(hcd, 
+     nodePar = nodePar, 
+     axes = FALSE,                    # axes par défaut désactivés
+     ylab = "Distance (sqrt(Ward.D2x2))", 
+     ylim = c(0, 2000),               # limite de l'axe Y
+     cex.lab = 0.6)                   # taille des labels
+
+# Ajout manuel de l'axe Y avec des intervalles précis
+axis(2, at = c(0, 500, 1000, 1500, 2000),
+     cex.axis = 0.6, lwd = 1)
+
+
+```
+
+## visualisation spatiale des clusters
+
+```{r,fig.height=6,fig.width=6,warning=FALSE}
+# --- Découpage en clusters à partir de l'hierarchie ---
+cut_wardd2 <- cutree(hc_fpca, k = 6)   # découpage en 6 clusters
+
+# Réassignation des clusters pour un ordre souhaité dans la visualisation
+loc_cut <- cut_wardd2
+loc_cut[cut_wardd2 == 1] <- 1
+loc_cut[cut_wardd2 == 2] <- 6
+loc_cut[cut_wardd2 == 3] <- 4
+loc_cut[cut_wardd2 == 4] <- 5
+loc_cut[cut_wardd2 == 5] <- 2
+loc_cut[cut_wardd2 == 6] <- 3
+cut_wardd2 <- loc_cut
+
+# --- Préparation des données pour la carte spatiale ---
+data_melted <- data.frame(
+  Bloc = names(loc_cut),    # nom du bloc
+  cluster = cut_wardd2      # cluster associé
+)
+data_melted$colonne <- as.factor(substr(data_melted$Bloc, 1, 1))  # lettre colonne du bloc
+data_melted$ligne <- as.factor(substr(data_melted$Bloc, 2, nchar(data_melted$Bloc)))  # numéro de ligne
+data_melted$ligne <- factor(data_melted$ligne, levels = sort(unique(as.numeric(as.character(data_melted$ligne)))))
+
+# --- Définition des couleurs pour les clusters ---
+clust.col <- c(
+  "#D73027",  # rouge vif
+  "#F46D43",  # orange
+  "#FDAE61",  # orange clair
+  "#FDDE61",  # jaune clair
+  "#5DA9E9",  # bleu clair
+  "#14295E"   # bleu foncé
+)
+
+# --- Gestion des colonnes et positions pour le tracé ---
+col_levels <- rev(levels(data_melted$colonne))   # inversion pour affichage correct
+col_widths <- ifelse(col_levels %in% c("A", "F"), 0.5, 1)  # largeur spécifique pour certaines colonnes
+
+x_min <- cumsum(c(0, head(col_widths, -1)))  # position minimale
+x_max <- x_min + col_widths                  # position maximale
+x_center <- (x_min + x_max) / 2             # position centrale pour labels
+
+col_coords <- data.frame(
+  colonne = col_levels,
+  width = col_widths,
+  x_center = x_center,
+  xmin = x_min,
+  xmax = x_max
+)
+
+# Joindre les coordonnées continues aux données
+data_rect <- data_melted %>%
+  mutate(colonne = factor(colonne, levels = rev(levels(colonne)))) %>%
+  left_join(col_coords, by = "colonne") %>%
+  mutate(
+    row_num = as.numeric(ligne),
+    ymin = row_num - 0.5,
+    ymax = row_num + 0.5
+  )
+
+# --- Construction du graphique ---
+ggplot() +
+  # Blocs colorés par cluster
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = factor(cluster)),
+    color = "black"
+  ) +
+
+  # Grande route horizontale (ligne 6)
+  geom_segment(
+    data = filter(data_rect, row_num == 6),
+    aes(x = xmin, xend = xmax, y = row_num - 0.5, yend = row_num - 0.5, color = "Grande route"),
+    linewidth = 2
+  ) +
+
+  # Routes verticales pour certaines colonnes
+  {
+    route_cols <- c("F","B", "C", "D", "E")
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      x_mid <- x_max[i]
+      data.frame(x = x_mid)
+    }) %>% bind_rows()
+
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+
+  # Couleurs
+  scale_fill_manual(name = "Cluster", values = clust.col) +
+  scale_color_manual(name = "", values = c("Grande route" = "black", "Route moyenne" = "black")) +
+
+  # Légendes
+  guides(
+    fill = guide_legend(order = 1),
+    color = guide_legend(
+      order = 2,
+      override.aes = list(linewidth = c(2, 1.1), color = c("black", "black"))
+    )
+  ) +
+
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",  # inversion pour que ligne 1 en haut
+    expand = c(0, 0)
+  ) +
+
+  coord_fixed() +  # aspect carré
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "(b)", x = "Colonne", y = "Ligne")
+
+```
+
+## Visualisation temporelle
+
+```{r,fig.height=6,fig.width=6,warning=FALSE}
+# --- Fusion des données fonctionnelles avec les clusters ---
+data_merged <- data.frame(Bloc = infection_wide$Bloc, cluster = cut_wardd2)  # associer chaque bloc à son cluster
+data_merged <- merge(Wd_long, data_merged, by = "Bloc")  # fusionner avec les valeurs FPCA en format long
+
+# --- Fonction bootstrap pour calculer la moyenne ---
+boot_mean <- function(data, indices) {
+  mean(data[indices], na.rm = TRUE)  # moyenne avec exclusion des NA
+}
+
+# --- Calcul des moyennes et IC par cluster et par date ---
+data_cluster_avg <- data_merged %>%
+  group_by(Date, cluster) %>%      # pour chaque date et chaque cluster
+  group_modify(~{
+    res <- boot(.x$fpca, boot_mean, R = 1000)   # bootstrap avec 1000 répétitions
+    tibble(
+      Nb_malades_moyen = mean(.x$fpca, na.rm = TRUE),  # moyenne simple
+      ci_low = boot.ci(res, type = "perc")$percent[4], # borne inférieure IC 95%
+      ci_high = boot.ci(res, type = "perc")$percent[5] # borne supérieure IC 95%
+    )
+  }) %>%
+  ungroup()
+
+# --- Tracé de l'évolution temporelle des clusters ---
+ggplot(data_cluster_avg, aes(x = Date, y = Nb_malades_moyen, color = as.factor(cluster), fill = as.factor(cluster))) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.2) +  # bande de confiance
+  geom_line(size = 1.2) +  # courbe de la moyenne
+  labs(
+    title = "(a)",
+    x = "Temps",
+    y = "Nombre de plants malades/ha",
+    color = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_color_manual(values = clust.col) +  # couleurs pour les clusters
+  scale_fill_manual(values = clust.col) +   # mêmes couleurs pour le ruban
+  theme_minimal() +
+  theme(
+    legend.position = "none",                # cacher la légende
+    plot.title = element_text(hjust = 0.5)   # centrer le titre
+  )
+
+
+```
+
+```{r,warning=FALSE,fig.height=12,fig.width=12}
+# --- Préparation des scores FPCA et des clusters ---
+df_scores <- as.data.frame(z_fpca_scores)  # conversion des scores FPCA en dataframe
+df_scores$cluster <- cut_wardd2            # ajout de l'information cluster à chaque bloc
+
+# --- Calcul des centres de cluster ---
+cl_cen_reord <- df_scores %>%
+  group_by(cluster) %>%                     # pour chaque cluster
+  summarise(across(everything(), mean)) %>% # calcul de la moyenne de chaque score FPCA
+  ungroup()
+
+# Conversion en data.frame classique pour faciliter l'indexation
+cl_cen_reord <- as.data.frame(cl_cen_reord)
+rownames(cl_cen_reord) <- cl_cen_reord$cluster
+cl_cen_reord$cluster <- NULL
+
+# --- Préparation des labels détaillés pour les facettes ---
+effectifs <- data.frame(
+  cluster = sort(unique(cut_wardd2))
+) %>%
+  rowwise() %>%
+  mutate(
+    n = sum(cut_wardd2 == cluster),  # nombre de blocs par cluster
+    scores_vec = paste0("scores=[", round(cl_cen_reord[as.character(cluster), 1], 2),
+                        ",", round(cl_cen_reord[as.character(cluster), 2], 2),"]"),  # valeurs moyennes des scores FPCA
+    label = paste0("Cluster ", cluster, " (n = ", n, ")\n", scores_vec)  # label complet pour facettes
+  )
+
+# Création d'un dictionnaire pour lier cluster -> label
+cluster_labels <- effectifs$label
+names(cluster_labels) <- effectifs$cluster
+
+# --- Tracé des courbes individuelles + moyenne par cluster ---
+ggplot() + 
+  # Courbes individuelles de chaque bloc
+  geom_line(data = data_merged, 
+            aes(x = Date, y = fpca, group = Bloc), 
+            color = "grey", size = 0.8, alpha = 0.5) + 
+  # Courbes de la moyenne par cluster
+  geom_line(data = data_cluster_avg, 
+            aes(x = Date, y = Nb_malades_moyen, color = as.factor(cluster)), 
+            size = 1.2) + 
+  # Facettage par cluster avec labels personnalisés
+  facet_wrap(~ cluster, labeller = labeller(cluster = cluster_labels)) + 
+  scale_color_manual(values = clust.col) +  # couleurs des clusters
+  labs(
+    title = "Évolution du nombre de malades par cluster : courbes individuelles + moyenne",
+    x = "Temps",
+    y = "Nombre de plants malades/ha",
+    color = "Cluster"
+  ) + 
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 8, angle = 45, hjust = 1)  # rotation 45° pour lisibilité
+  )
+
+```
+
+
+
+
+
+
+
+
+## Différence des scores entre les groupes
+
+
+```{r}
+df_long <- df_scores %>%
+  mutate(id = row_number()) %>%  # Ajoute un identifiant unique pour chaque ligne (bloc)
+  pivot_longer(
+    cols = starts_with("pca_score"),  # Transformation des colonnes des scores FPCA en format long
+    names_to = "Composante",          # Nom de la colonne qui contiendra le nom de la composante
+    values_to = "Score"               # Nom de la colonne qui contiendra la valeur du score
+  ) %>%
+  mutate(
+    # Renommage des composantes pour les rendre plus lisibles
+    Composante = recode(Composante,
+                        "pca_score1" = "Score PC1",
+                        "pca_score2" = "Score PC2")
+  )
+
+# Calcul du nombre de blocs par cluster pour préparer les labels
+effectifs <- data_merged %>%
+  distinct(Bloc, cluster) %>%  # On garde une seule ligne par bloc
+  count(cluster) %>%            # Comptage du nombre de blocs par cluster
+  rowwise() %>%
+  mutate(
+    label = paste0(cluster, " (N = ", n, ")")  # Création d’un label "Cluster X (N = …)"
+  )
+
+# Création d’un dictionnaire associant chaque cluster à son label
+cluster_labels <- effectifs$label
+
+```
+
+
+```{r}
+set.seed(123)  # Fixe la graine pour que les résultats du bootstrap soient reproductibles
+
+# Fonction de bootstrap qui calcule la moyenne des échantillons sélectionnés
+boot_mean <- function(data, indices) {
+  return(mean(data[indices]))  # moyenne sur les indices tirés avec remise
+}
+
+# Calcul des moyennes bootstrap et des intervalles de confiance
+boot_stats <- df_long %>%
+  group_by(Composante, cluster) %>%  # On regroupe par composante FPCA et par cluster
+  summarise(
+    boot_obj = list(boot(Score, boot_mean, R = 500000)),  # Application du bootstrap avec 500 000 répétitions
+    .groups = "drop"  # supprime la hiérarchie de groupement
+  ) %>%
+  mutate(
+    mean = sapply(boot_obj, function(b) mean(b$t)),        # Moyenne bootstrap des scores
+    lower = sapply(boot_obj, function(b) quantile(b$t, 0.025)),  # Limite inférieure de l'IC 95%
+    upper = sapply(boot_obj, function(b) quantile(b$t, 0.975)),  # Limite supérieure de l'IC 95%
+    stat = "Moyenne ± IC bootstrap"  # Étiquette descriptive pour le graphique
+  )
+
+boot_stats  # Affiche le tableau final avec la moyenne et les IC pour chaque cluster et composante
+
+```
+
+
+```{r,fig.height=6,fig.width=12}
+
+ggplot(df_long, aes(y = as.factor(cluster), x = Score)) +
+
+  # 1️⃣ Points individuels : chaque score FPCA pour chaque bloc est représenté
+  geom_jitter(aes(color = as.factor(cluster)), 
+              height = 0.3,   # légère dispersion verticale pour éviter le chevauchement
+              alpha = 0.9,    # transparence
+              size = 1.5, 
+              show.legend = FALSE) +
+
+  # 2️⃣ Moyenne bootstrap : point représentant la moyenne du cluster
+  geom_point(
+    data = boot_stats,
+    aes(y = as.factor(cluster), x = mean, shape = stat, group = stat),
+    inherit.aes = FALSE,  # n'hérite pas des mappings globaux (df_long)
+    size = 2.2,
+    color = "grey60",
+    show.legend = FALSE
+  ) +
+
+  # 3️⃣ Barre d'erreur horizontale : IC 95 % calculé par bootstrap
+  geom_errorbarh(
+    data = boot_stats,
+    aes(y = as.factor(cluster), xmin = lower, xmax = upper, linetype = stat, group = stat),
+    inherit.aes = FALSE,
+    color = "grey60",
+    height = 0.15,  # épaisseur verticale de la barre
+    size = 1,
+    show.legend = FALSE
+  ) +
+
+  # 4️⃣ Facettage : une facette par composante FPCA (PC1, PC2)
+  facet_wrap(~ Composante, scales = "free_x") +
+
+  # 5️⃣ Palette de couleurs pour les clusters
+  scale_color_manual(values = clust.col) +
+
+  # 6️⃣ Etiquettes des clusters avec le nombre de blocs
+  scale_y_discrete(labels = cluster_labels) +
+
+  # 7️⃣ Forme et type de ligne pour la moyenne ± IC bootstrap
+  scale_shape_manual(name = NULL, values = c("Moyenne ± IC bootstrap" = 16)) +
+  scale_linetype_manual(name = NULL, values = c("Moyenne ± IC bootstrap" = "solid")) +
+
+  # 8️⃣ Supprime la légende des couleurs car elle est redondante
+  guides(color = "none") +
+
+  # 9️⃣ Labels axes
+  labs(x = "Score", y = "Cluster") +
+
+  #  🔟 Thème minimal et ajustements esthétiques
+  theme_minimal() +
+  theme(
+    panel.spacing.y = unit(1, "lines"),         # espace vertical entre facettes
+    panel.border = element_rect(color = "black", fill = NA)  # cadre autour de chaque facette
+  )
+
+
+```
+
+
+
+

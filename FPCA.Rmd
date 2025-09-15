@@ -1,0 +1,640 @@
+---
+title: "FPCA"
+output: html_document
+date: "2025-06-17"
+---
+
+```{r,warning=FALSE}
+set.seed(1983)
+```
+
+# Imports formatage données
+
+```{r,warning=FALSE}
+library(refund)   # pour la FPCA (analyse en composantes principales fonctionnelle)
+library(ggplot2)  # pour la visualisation
+library(dplyr)    # pour la manipulation de données
+library(tidyr)    # pour le pivot_wider (passage long -> large)
+```
+
+
+```{r,warning=FALSE}
+# Chargement des données nettoyées
+Infection_Table = read.csv("Infection_Table_clean.csv", stringsAsFactors = TRUE)
+
+# Mise en forme des colonnes utiles
+Infection_Table = Infection_Table %>% 
+  mutate(
+    Date = as.Date(Date),         # conversion de la variable Date en format date
+    ligne = as.factor(ligne)      # ligne comme facteur
+  )
+
+# Ajout d’une colonne indiquant la "grande route" (ligne 5)
+Infection_Table$Route <- ifelse(Infection_Table$ligne == 5, "Grande route", NA)
+
+# Création d’un label "Semaine XX (année)" et sélection des colonnes utiles
+Infection_Table <- Infection_Table %>%
+  mutate(
+    Semaine_label = paste0("Semaine ", sprintf("%02d", Week), " (", Year, ")")
+  ) %>%
+  select(Nb_malades_cumule_dens, Bloc, Date)
+
+# Résumé statistique rapide de la table
+summary(Infection_Table)
+
+```
+
+```{r,warning=FALSE}
+# Passage en format large : chaque ligne = un bloc, chaque colonne = une date
+infection_wide <- Infection_Table %>%
+  filter(!(Bloc %in% c("C1", "A5"))) %>%   # on retire les blocs C1 et A5 (premiers infectés)
+  mutate(Date = as.Date(Date)) %>%         # on s’assure que Date est bien en format date
+  arrange(Bloc, Date) %>%                  # on trie par Bloc puis Date
+  pivot_wider(                             # passage en format large
+    names_from = Date,                     # colonnes = les dates
+    values_from = Nb_malades_cumule_dens   # valeurs = nb de malades cumulé/ha
+  )
+
+# Matrice de données Y : lignes = blocs, colonnes = temps
+Y_mat <- as.matrix(infection_wide[,-1])  
+
+```
+
+For univariate P-splines, a number of min{n/4, 35} knots was recommended by
+Ruppert (2002) --> n=25
+
+
+# FPCA selection du modéle
+
+## Pourcentage inertie
+
+```{r,warning=FALSE}
+# FPCA avec 10 composantes principales (npc = 10)
+res_fpca <- fpca.face(Y_mat, center = TRUE, npc = 10, knots = 25)
+
+# FPCA complète pour obtenir la totalité de l’inertie (pve = 1 = 100%)
+res_fpca_tout <- fpca.face(Y_mat, center = TRUE, pve = 1, knots = 25)
+
+# Calcul de la proportion d’inertie expliquée par chaque composante
+# -> valeur propre de la PC / somme totale des valeurs propres
+prc_inertie <- res_fpca$evalues / sum(res_fpca_tout$evalues)
+
+# Passage en pourcentage (arrondi à 2 décimales)
+prc_inertie_pc <- round(prc_inertie * 100, 2)
+
+# Inertie cumulée (pourcentage cumulé)
+cumulative <- cumsum(prc_inertie_pc)
+
+# Affichage clair des résultats dans la console
+cat("Pourcentage d'inertie expliquée par chaque PC :\n")
+for(i in seq_along(prc_inertie_pc)) {
+  cat(paste0("PC", i, " : ", prc_inertie_pc[i], "% (cumul = ", cumulative[i], "%)\n"))
+}
+
+# x = numéro des composantes principales
+x <- 1:length(prc_inertie_pc)
+
+# Graphe : inertie expliquée par chaque PC
+plot(
+  x, prc_inertie_pc, type = "b", pch = 19, col = "#4575B4",
+  xlab = "Composantes principales",
+  ylab = "% d'inertie expliquée",
+  main = "Pourcentage d'inertie expliquée par composante",
+  xaxt = "n", ylim = c(0, max(prc_inertie_pc) + 10)  # marge verticale
+)
+
+# Personnalisation axe des x avec labels PC1, PC2, ...
+axis(1, at = x, labels = paste0("PC", x), las = 2)
+
+# Ajout des valeurs numériques au-dessus des points (avec un petit décalage vertical)
+text(x + 0.05, prc_inertie_pc + 7, labels = paste0(prc_inertie_pc, "%"), cex = 0.8)
+
+
+```
+
+## Visualisation eigenfunction
+
+
+```{r,warning=FALSE}
+# --- FPCA --- 
+# On extrait les 4 premières composantes principales fonctionnelles
+res_fpca <- fpca.face(Y_mat, center = TRUE, npc = 4, knots = 25)
+
+# Récupération des dates (colonnes de Y_mat) pour l’axe du temps
+sind <- as.Date(colnames(Y_mat))
+
+# Construction d’un data.frame pour ggplot :
+# - PC1 et PC2
+# - valeurs des fonctions propres (efunctions)
+# - fonction moyenne (mu)
+df_plt <- data.frame(
+  "PC" = rep(paste0("PC", 1:2), each = ncol(Y_mat)),   # répète PC1 / PC2
+  "time" = rep(sind, 2),                              # axe temporel
+  "fPCA" = as.vector(res_fpca$efunctions[, 1:2]),     # fonctions propres associées
+  mu = res_fpca$mu                                    # fonction moyenne
+)
+
+# --- Graphe des fonctions propres (PC1 et PC2) ---
+fpca_plot <- df_plt %>% 
+  ggplot(aes(x = time, y = fPCA, color = PC)) + 
+  geom_line(linewidth = 1.25) + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) + 
+  theme_minimal(base_size = 10) + 
+  xlab("Temps") + 
+  ylab(expression("Fonctions propres estimées (" ~ phi[k](s) ~ ")")) + 
+  theme(
+    legend.position = c(0.18, 0.2),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.line.x = element_line(linewidth = 1, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 1, linetype = "solid", colour = "black"),
+    strip.text = element_text(face = "bold", size = 8, hjust = 0.03),
+    axis.ticks.x = element_line(linewidth = 1),
+    axis.ticks.y = element_line(linewidth = 1)
+  ) + 
+  labs(color = "Fonctions propres") + 
+  guides(color = guide_legend(ncol = 1))
+
+# --- Graphe de la fonction moyenne ---
+mean_plot <- df_plt %>% 
+  ggplot(aes(x = time, y = mu)) + 
+  geom_line(linewidth = 1.25) + 
+  theme_minimal(base_size = 18) + 
+  xlab("Temps") + 
+  ylab(expression("Fonction moyenne")) + 
+  theme(
+    legend.position = c(0.9, 0.9),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.line.x = element_line(linewidth = 1, linetype = "solid", colour = "black"),
+    axis.line.y = element_line(linewidth = 1, linetype = "solid", colour = "black"),
+    strip.text = element_text(face = "bold", size = 18, hjust = 0.03),
+    axis.ticks.x = element_line(linewidth = 1),
+    axis.ticks.y = element_line(linewidth = 1)
+  )
+
+# Affichage
+mean_plot   # fonction moyenne
+fpca_plot   # PC1 et PC2
+
+
+```
+## Scores/ contributions aux "axes"
+
+```{r,warning=FALSE}
+# --- Fusion des scores et des blocs ---
+# res_fpca$scores = coordonnées des blocs dans l’espace des PC
+# On associe ces scores à l’identifiant du bloc
+scores_blocs <- cbind(as.data.frame(res_fpca$scores), Bloc = infection_wide$Bloc)
+
+# Renommer les deux premières colonnes pour plus de clarté
+names(scores_blocs)[1:2] <- c("PC1", "PC2")
+
+# --- Fonction utilitaire ---
+# Affiche les 'n' blocs qui ont la plus forte contribution (valeurs extrêmes)
+# pour une composante principale donnée
+top_contributions <- function(component_name, n = 5) {
+  df <- scores_blocs[order(-abs(scores_blocs[[component_name]])), 
+                     c(component_name, "Bloc")]
+  head(df, n)
+}
+
+# --- Exemple d’utilisation ---
+# Les 10 blocs les plus "marquants" sur PC1 et PC2
+top_contributions("PC1", 10)
+top_contributions("PC2", 10)
+
+
+
+```
+
+## Visualisation eigenfunction
+
+```{r,warning=FALSE}
+# Nombre de composantes principales à analyser
+K <- 2
+# Nombre de courbes individuelles à tracer par côté (high/low)
+n_plt <- 6
+
+# --- Préparation des dataframes vides ---
+
+# Courbes individuelles (chaque bloc extrême sur une PC)
+df_plt_ind <- expand.grid(
+  "sind" = sind,
+  "id" = 1:n_plt,
+  "high" = c("high","low"),
+  "PC" = paste0("PC ",1:K)
+) %>% mutate(high = relevel(high, ref="low"))
+
+# Courbes moyennes (moyenne des blocs à scores extrêmes)
+df_plt_ind_mu <- expand.grid(
+  "sind" = sind,
+  "high" = c("high","low"),
+  "PC" = paste0("PC ",1:K),
+  "value" = NA
+) %>% mutate(high = relevel(high, ref="low"))
+
+# --- Boucle sur les K composantes principales ---
+mu_vec <- c()   # stockera les moyennes
+ind_vec <- c()  # stockera les courbes individuelles
+
+for(k in 1:K){
+  # Seuils pour définir les blocs "faibles" et "forts"
+  q_k <- quantile(res_fpca$scores[,k], c(0.1, 0.9))
+  
+  # Indices des blocs extrêmes
+  inx_low_k <- which(res_fpca$scores[,k] <= q_k[1])
+  inx_high_k <- which(res_fpca$scores[,k] > q_k[2])
+  
+  # Moyenne des courbes dans chaque groupe extrême
+  mu_low_k <- colMeans(res_fpca$Yhat[inx_low_k,])
+  mu_high_k <- colMeans(res_fpca$Yhat[inx_high_k,])
+  
+  # Ajout aux vecteurs globaux
+  mu_vec <- c(mu_vec, mu_low_k, mu_high_k)
+  
+  # Courbes individuelles : n_plt tirées au hasard
+  val_low_k <- as.vector(t(res_fpca$Yhat[sample(inx_low_k, size=n_plt),]))
+  val_high_k <- as.vector(t(res_fpca$Yhat[sample(inx_high_k, size=n_plt),]))
+  
+  ind_vec <- c(ind_vec, val_low_k, val_high_k)
+}
+
+# Injection dans les dataframes
+df_plt_ind_mu$value <- mu_vec
+df_plt_ind$value <- ind_vec
+
+```
+
+
+
+## Visualisation signification "axes"
+
+```{r,warning=FALSE}
+# Filtrage des courbes individuelles pour PC1 et création d'un identifiant unique pour chaque courbe
+df_ind <- df_plt_ind %>%
+    filter(PC == "PC 1") %>%             # On ne garde que PC1
+    mutate(id = factor(id),              # Transforme l'identifiant en facteur
+           id_high = paste0(id, "_", high))  # Crée un ID unique combinant id et high/low
+
+# Filtrage des courbes moyennes pour PC1
+df_mu <- df_plt_ind_mu %>%
+    filter(PC == "PC 1")                 # On ne garde que PC1
+
+# Construction du graphique
+plt_ind <- df_ind %>% 
+        mutate(id = factor(id),
+               id_high = paste0(id,"_",high)) %>%
+        ggplot() + 
+        # Tracé des courbes individuelles (high/low) avec transparence
+        geom_line(aes(x=sind, y=value, group=id_high, color=high), alpha=0.5) + 
+        # Thème minimal et personnalisation des axes
+        theme_minimal(base_size=18) + 
+        theme(legend.position="none",                 # Supprime la légende des courbes individuelles
+              panel.grid.major.y = element_blank(),  # Supprime le quadrillage vertical majeur
+              panel.grid.major.x = element_blank(),  # Supprime le quadrillage horizontal majeur
+              panel.grid.minor.x = element_blank(),  # Supprime le quadrillage horizontal mineur
+              panel.grid.minor.y = element_blank(),  # Supprime le quadrillage vertical mineur
+              axis.line.x = element_line(size = 1, linetype = "solid", colour = "black"),  # Axe X noir
+              axis.line.y = element_line(size = 1, linetype = "solid", colour = "black"),  # Axe Y noir
+              strip.text = element_text(face="bold", size=18, hjust=0.03),
+              axis.ticks.x = element_line(size = 1), 
+              axis.ticks.y = element_line(size = 1)) + 
+        # Labels des axes et titre
+        xlab("Temps") + 
+        ylab("Nombre de plantes infectés") + 
+        ggtitle("PC1 ( 96.6 % de variabilité)") +
+        # Tracé des courbes moyennes high/low (ligne épaisse)
+        geom_line(aes(x=sind, y=value, group=high, color=high),
+                  data=df_mu, lwd=2) +
+        # Tracé de la moyenne générale de toutes les courbes (noir en pointillés)
+        stat_summary(aes(x = sind, y = value),
+                     fun = mean,
+                     geom = "line",
+                     colour = "black",
+                     linewidth = 1.2,
+                     linetype = "dashed")
+
+# Affichage du graphique
+plt_ind
+
+```
+
+```{r,warning=FALSE}
+# Filtrage des courbes individuelles pour PC2 et création d'un identifiant unique
+df_ind <- df_plt_ind %>%
+    filter(PC == "PC 2") %>%                 # On ne garde que PC2
+    mutate(id = factor(id),                  # Transforme l'identifiant en facteur
+           id_high = paste0(id, "_", high)) # Crée un ID unique combinant id et high/low
+
+# Filtrage des courbes moyennes pour PC2
+df_mu <- df_plt_ind_mu %>%
+    filter(PC == "PC 2")                     # On ne garde que PC2
+
+# Construction du graphique
+plt_ind <- df_ind %>% 
+        mutate(id = factor(id),
+               id_high = paste0(id,"_",high)) %>%
+        ggplot() + 
+        # Tracé des courbes individuelles (high/low) avec transparence
+        geom_line(aes(x=sind, y=value, group=id_high, color=high), alpha=0.5) + 
+        # Thème minimal et personnalisation des axes
+        theme_minimal(base_size=18) + 
+        theme(legend.position="none",                 # Supprime la légende des courbes individuelles
+              panel.grid.major.y = element_blank(),  # Supprime le quadrillage vertical majeur
+              panel.grid.major.x = element_blank(),  # Supprime le quadrillage horizontal majeur
+              panel.grid.minor.x = element_blank(),  # Supprime le quadrillage horizontal mineur
+              panel.grid.minor.y = element_blank(),  # Supprime le quadrillage vertical mineur
+              axis.line.x = element_line(size = 1, linetype = "solid", colour = "black"), # Axe X noir
+              axis.line.y = element_line(size = 1, linetype = "solid", colour = "black"), # Axe Y noir
+              strip.text = element_text(face="bold", size=18, hjust=0.03),
+              axis.ticks.x = element_line(size = 1),
+              axis.ticks.y = element_line(size = 1)) + 
+        # Labels des axes et titre
+        xlab("Temps") + 
+        ylab("Nombre de plantes infectés") + 
+        ggtitle("PC2 ( 2.62 % de variabilité)") +
+        # Tracé des courbes moyennes high/low (ligne épaisse)
+        geom_line(aes(x=sind, y=value, group=high, color=high),
+                  data=df_mu, lwd=2) +
+        # Tracé de la moyenne générale de toutes les courbes (noir en pointillés)
+        stat_summary(aes(x = sind, y = value),
+                     fun = mean,
+                     geom = "line",
+                     colour = "black",
+                     linewidth = 1.2,
+                     linetype = "dashed")
+
+# Affichage du graphique
+plt_ind
+
+```
+
+
+
+
+
+## FPCA vérification perte d'information avec R2
+
+
+### Seulement les deux premiers axes
+
+#### R2 global 
+
+
+```{r,warning=FALSE}
+# FPCA avec 2 composantes principales
+fit = fpca.face(Y_mat, center = TRUE, npc = 2, knots = 25)
+
+# Extraction des courbes lissées (Ŷ) par FPCA
+splines = fit$Yhat
+
+# Calcul de la variance totale pour chaque ligne (chaque bloc)
+var_Y = apply(Y_mat, 1, var)  
+
+# Calcul de l'erreur quadratique moyenne (MSE) pour chaque ligne
+# MSE = moyenne des carrés des différences entre les observations et les courbes lissées
+MSE = rowMeans((splines - Y_mat)^2)
+
+# Calcul du R² par ligne : proportion de variance expliquée
+# R² = 1 - (MSE / variance totale)
+R2 = 1 - (MSE / var_Y)
+
+# Moyenne du R² sur toutes les lignes (blocs)
+mean(R2)
+
+```
+
+#### R2 local
+
+
+```{r,warning=FALSE}
+# Préparation des données
+data_melted = data.frame(Bloc = as.character(infection_wide$Bloc), MSE = R2)  # R2 par bloc
+data_melted$colonne <- as.factor(substr(data_melted$Bloc, 1, 1))  # extraire la colonne
+data_melted$ligne <- as.factor(substr(data_melted$Bloc, 2, nchar(data_melted$Bloc)))  # extraire la ligne
+data_melted$ligne <- factor(data_melted$ligne, levels = sort(unique(as.numeric(as.character(data_melted$ligne)))))  # ordre des lignes
+
+# Définition des colonnes et largeurs
+col_levels <- rev(levels(data_melted$colonne))  # inversion de l'ordre pour affichage
+col_widths <- ifelse(col_levels %in% c("A", "F"), 0.5, 1)  # colonnes étroites aux extrémités
+x_min <- cumsum(c(0, head(col_widths, -1)))  # coordonnée x min
+x_max <- x_min + col_widths  # coordonnée x max
+x_center <- (x_min + x_max) / 2  # centre des colonnes
+
+# Table de coordonnées pour chaque colonne
+col_coords <- data.frame(
+  colonne = col_levels,
+  width = col_widths,
+  x_center = x_center,
+  xmin = x_min,
+  xmax = x_max
+)
+
+# Création des rectangles pour la heatmap
+data_rect <- data_melted %>%
+  mutate(colonne = factor(colonne, levels = rev(levels(colonne)))) %>%  # forcer ordre inversé
+  left_join(col_coords, by = "colonne") %>%  # ajouter coordonnées x
+  mutate(
+    row_num = as.numeric(ligne),
+    ymin = row_num - 0.5,  # bord inférieur du rectangle
+    ymax = row_num + 0.5   # bord supérieur du rectangle
+  )
+
+# --- Construction du graphique
+ggplot() +
+  # Blocs : rectangles remplis selon R²
+  geom_rect(
+    data = data_rect,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = MSE),
+    color = "black"
+  ) +
+
+  # Labels de R² au centre des rectangles
+  geom_text(
+    data = data_rect,
+    aes(x = x_center, y = row_num, label = round(MSE,2)),
+    color = "black",
+    size = 2
+  ) +
+
+  # Grande route horizontale (ici ligne 6)
+  geom_segment(
+    data = filter(data_rect, row_num == 6),
+    aes(x = xmin, xend = xmax,
+        y = row_num - 0.5, yend = row_num - 0.5,
+        color = "Grande route"),
+    linewidth = 2
+  ) +
+
+  # Routes verticales
+  {
+    route_cols <- c("F","B","C","D","E")  # colonnes avec routes
+    segs <- lapply(route_cols, function(col) {
+      i <- which(col_levels == col)
+      x_mid <- x_max[i]
+      data.frame(x = x_mid)
+    }) %>% bind_rows()
+
+    geom_segment(
+      data = segs %>% crossing(y = unique(data_rect$row_num)),
+      aes(x = x, xend = x, y = y - 0.5, yend = y + 0.5, color = "Route moyenne"),
+      linewidth = 1.1,
+      inherit.aes = FALSE
+    )
+  } +
+
+  # Dégradé de couleur pour R² et couleurs des routes
+  scale_fill_continuous(low = "grey", high = "red", trans = "log10") +
+  scale_color_manual(name = "", values = c("Grande route" = "black", "Route moyenne" = "black")) +
+
+  # Guides (légendes)
+  guides(
+    fill = guide_colorbar(order = 1),
+    color = guide_legend(
+      order = 2,
+      override.aes = list(
+        linewidth = c(2, 1.1),
+        color = c("black", "black")
+      )
+    )
+  ) +
+
+  # Axes
+  scale_x_continuous(
+    breaks = x_center,  # position des ticks
+    labels = col_levels,
+    expand = c(0, 0),
+    position = "top"
+  ) +
+  scale_y_continuous(
+    breaks = sort(unique(data_rect$row_num)),
+    trans = "reverse",  # inverser y pour correspondre à la disposition parcelle
+    expand = c(0, 0)
+  ) +
+
+  coord_fixed() +  # rapport 1:1
+  theme_minimal() +
+  labs(
+    x = "Colonne",
+    y = "Ligne",
+    fill = "R²"
+  )
+
+
+```
+
+
+
+#### Visualisation courbes mal reconstruites
+
+```{r}
+# Assigner les noms des blocs (lignes) aux splines FPCA
+rownames(splines) <- infection_wide$Bloc
+
+# Conversion de la matrice splines en data frame pour manipulation avec tidyverse
+splines_long <- as.data.frame(splines)
+
+# Les colonnes représentent les dates, on les nomme selon les dates uniques présentes
+colnames(splines_long) <- levels(as.factor(Infection_Table$Date))
+
+# Ajouter une colonne pour identifier le bloc correspondant à chaque ligne
+splines_long$Bloc <- rownames(splines_long)
+
+# Conversion du data frame du format "large" au format "long" pour ggplot
+splines_long <- splines_long %>%
+  pivot_longer(
+    cols = -Bloc,          # toutes les colonnes sauf Bloc
+    names_to = "Date",     # nouvelle colonne contenant les noms des colonnes (dates)
+    values_to = "fpca"     # nouvelle colonne contenant les valeurs des splines
+  )
+
+# Conversion de la colonne Date en type Date
+splines_long$Date <- as.Date(splines_long$Date)
+
+```
+
+```{r,warning=FALSE}
+# Conversion de la matrice Y_mat (observations brutes) en data frame
+Y_mat_long  <- as.data.frame(Y_mat)
+
+# Nommage des colonnes selon les dates présentes dans Infection_Table
+colnames(Y_mat_long) <- levels(as.factor(Infection_Table$Date))
+
+# Ajouter une colonne Bloc pour identifier chaque ligne (bloc)
+Y_mat_long$Bloc <- as.character(infection_wide$Bloc)
+
+# Conversion du format large au format long (tidy) pour ggplot
+Y_mat_long <- Y_mat_long  %>%
+  pivot_longer(
+    cols = -Bloc,       # toutes les colonnes sauf Bloc
+    names_to = "Date",  # colonne qui contiendra les dates
+    values_to = "Y"     # colonne qui contiendra les valeurs brutes (malades/ha)
+  )
+
+# Conversion de la colonne Date en type Date
+Y_mat_long$Date <- as.Date(Y_mat_long$Date)
+
+# Fusion des valeurs observées (Y) et des valeurs FPCA (fpca) par Bloc et Date
+plot_R2 <- merge(Y_mat_long, splines_long, by = c("Bloc", "Date"))
+
+# -------------------------
+# Premier sous-ensemble : blocs spécifiques à visualiser
+plot_R2_subset <- plot_R2 %>%
+  filter(Bloc %in% c("D8", "E8", "C8", "F10", "A9","D10"))
+
+# Tracé : points = observations, ligne = fpca
+ggplot(plot_R2_subset, aes(x = Date, group = Bloc, color = Bloc)) + 
+  geom_point(aes(y = Y), alpha = 0.6) +            # points observés
+  geom_line(aes(y = fpca), size = 1) +            # courbes FPCA
+  geom_text(
+    data = plot_R2_subset %>% group_by(Bloc) %>% filter(Date == max(Date)),
+    aes(y = fpca, label = Bloc),                  # étiquettes des blocs à la dernière date
+    hjust = -0.1, size = 3.5, show.legend = FALSE
+  ) +
+  labs(
+    title = "(b)",
+    x = "Temps",
+    y = "Valeur",
+    caption = "Points = malades / ha ; Ligne = fpca",
+    color = "Bloc"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)   # centre le titre
+  )
+
+# -------------------------
+# Deuxième sous-ensemble : autres blocs spécifiques
+plot_R2_subset <- plot_R2 %>%
+  filter(Bloc %in% c("E1", "D1","A1", "D2","B2", "D3"))
+
+# Tracé : même logique que ci-dessus
+ggplot(plot_R2_subset, aes(x = Date, group = Bloc, color = Bloc)) + 
+  geom_point(aes(y = Y), alpha = 0.6) +  
+  geom_line(aes(y = fpca), size = 1) +  
+  geom_text(
+    data = plot_R2_subset %>% group_by(Bloc) %>% filter(Date == max(Date)),
+    aes(y = fpca, label = Bloc),
+    hjust = -0.1, size = 3.5, show.legend = FALSE
+  ) +
+  labs(
+    title = "(a)",
+    x = "Temps",
+    y = "Valeur",
+    caption = "Points = malades / ha ; Ligne = fpca",
+    color = "Bloc"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5)
+  )
+
+
+```

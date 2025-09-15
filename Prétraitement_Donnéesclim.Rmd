@@ -1,0 +1,131 @@
+---
+title: "Recup données clim"
+output: html_document
+date: "2025-06-30"
+---
+
+
+# R Markdown
+
+```{r}
+# Packages nécessaires
+library(ISOweek)  # Conversion des dates en semaines ISO
+library(terra)    # Manipulation de fichiers NetCDF et extraction de valeurs
+
+```
+# Pluie temp vent récupération
+
+
+```{r}
+
+# Charger les fichiers NetCDF de pluie
+nc_files <- list.files("pluie/", pattern = "\\.nc$", full.names = TRUE)
+r_stack <- rast(nc_files)  # Empilement raster des fichiers
+
+# Définir le point d'intérêt (longitude = x, latitude = y)
+pt <- data.frame(lon = 39.692006, lat = -13.712329)
+
+# Convertir en vecteur spatial avec le même système de projection que le raster
+pt_vect <- vect(pt, crs = crs(r_stack))
+
+# Afficher la première couche avec le point
+plot(r_stack[[1]], main = "Zoom autour du point", axes = TRUE)
+points(pt$lon, pt$lat, col = "red", pch = 19, cex = 1.5)
+
+# Définir une fenêtre de zoom (0.5° autour du point)
+zoom_window <- 0.5  
+xlim <- c(pt$lon - zoom_window, pt$lon + zoom_window)
+ylim <- c(pt$lat - zoom_window, pt$lat + zoom_window)
+
+# Refaire le plot zoomé
+plot(r_stack[[1]], xlim = xlim, ylim = ylim, main = "Zoom + valeurs", axes = TRUE)
+points(pt$lon, pt$lat, col = "red", pch = 19, cex = 1.5)
+
+# Extraire un sous-raster centré sur le point (zone de 0.5° autour)
+sub_r <- crop(r_stack[[1]], ext(pt$lon - zoom_window, pt$lon + zoom_window,
+                                pt$lat - zoom_window, pt$lat + zoom_window))
+
+
+
+```
+
+
+```{r}
+# Récupérer les dates depuis les noms de fichiers
+dates <- sub(".*_(\\d{8})_.*", "\\1", basename(nc_files))
+dates <- as.Date(dates, format = "%Y%m%d")
+
+# Extraire les valeurs au point défini
+values <- terra::extract(r_stack, pt)
+
+# Construire un data.frame avec les dates et la précipitation
+pluie <- data.frame(date = dates, precipitation = as.numeric(values[1, -1]))
+
+# Vérifier un résumé
+summary(pluie)
+
+```
+
+```{r}
+# Charger les fichiers NetCDF de température
+nc_files <- list.files("temp/", pattern = "\\.nc$", full.names = TRUE)
+r_stack <- rast(nc_files)
+dates <- sub(".*_(\\d{8})_.*", "\\1", basename(nc_files))
+dates <- as.Date(dates, format = "%Y%m%d")
+
+# Extraire les valeurs
+values <- terra::extract(r_stack, pt)
+
+# Construire le data.frame température
+temp <- data.frame(date = dates, Température = as.numeric(values[1, -1]))
+summary(temp)
+
+```
+
+
+```{r}
+# Charger les fichiers NetCDF de vent
+nc_files <- list.files("vent/", pattern = "\\.nc$", full.names = TRUE)
+r_stack <- rast(nc_files)
+dates <- sub(".*_(\\d{8})_.*", "\\1", basename(nc_files))
+dates <- as.Date(dates, format = "%Y%m%d")
+
+# Extraire les valeurs
+values <- terra::extract(r_stack, pt)
+
+# Construire le data.frame vent
+vent <- data.frame(date = dates, vitesse_vent = as.numeric(values[1, -1]))
+summary(vent)
+
+```
+
+```{r}
+# Fusionner vent et température
+vt <- merge(vent, temp, by = "date")
+
+# Fusionner avec pluie
+vtp <- merge(vt, pluie, by = "date")
+
+# Vérifier le résumé
+summary(vtp)
+
+```
+
+```{r}
+# Définir la date de fin
+end_date <- as.Date("2016-05-01")
+
+# Garder uniquement les dates <= end_date
+vtp <- subset(vtp, date <= end_date)
+
+# Ajouter la semaine ISO correspondante
+vtp$iso_week <- ISOweek::ISOweek(vtp$date)
+
+# Sauvegarder l'objet final
+save(vtp, file = "vtp.RData")
+
+```
+
+
+
+

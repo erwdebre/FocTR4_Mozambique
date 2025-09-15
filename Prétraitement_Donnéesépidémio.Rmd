@@ -1,0 +1,65 @@
+---
+title: "Nettoyage données épidémiologiques"
+output: html_document
+date: "2025-04-14"
+---
+
+```{r setup, include=FALSE}
+library(readxl)   # Pour lire des fichiers Excel
+library(dplyr)    # Pour la manipulation de données (rename, mutate, group_by, etc.)
+library(tidyr)    # Pour la mise en forme (pivot_longer, separate, etc.)
+library(ISOweek)  # Pour convertir des semaines ISO en vraies dates
+```
+
+
+```{r}
+data2=read_xls("Cirad Jacaranda data.xls",sheet = "Infection Table")
+
+data2 <- data2 %>%
+  rename(Weeks=`...2`) %>%              # Renomme la colonne "...2" en "Weeks"
+  mutate_all(~replace(., is.na(.), 0))  # Remplace toutes les valeurs manquantes (NA) par 0
+
+data2 <- data2[-nrow(data2), ]   # Supprime la dernière ligne (souvent un total ou vide)
+data2 <- data2[, -2]             # Supprime la deuxième colonne inutile
+
+data2_Infection <- data2 %>%
+  rename(Bloc = ...1) %>%                # Renomme la première colonne en "Bloc"
+  pivot_longer(cols = -Bloc,             # Passe du format large au format long
+               names_to = "Semaine",     # Les noms des colonnes deviennent "Semaine"
+               values_to = "Nb_malades") # Les valeurs deviennent "Nb_malades"
+
+data2_Infection$colonne <- as.factor(substr(data2_Infection$Bloc, 1, 1))     # Lettre (A, B, C...)
+data2_Infection$ligne   <- as.numeric(substr(data2_Infection$Bloc, 2, nchar(data2_Infection$Bloc))) # Chiffre (1,2,3...)
+
+data2_Infection <- data2_Infection %>%
+  arrange(ligne) %>%
+  separate(Semaine, c("Year", "Week"), remove=TRUE, sep="-") %>%   # Sépare "YYYY-WW" en deux colonnes
+  mutate(Year = as.numeric(as.character(Year)),                     # Convertit en numérique
+         Week = as.numeric(as.character(Week))) %>%
+  mutate(ISO_semaine = sprintf("%d-W%02d-1", Year, Week),           # Construit la date ISO (lundi de la semaine)
+         Date = ISOweek2date(ISO_semaine))                          # Convertit en vraie date
+
+data2_Infection$ligne <- as.factor(data2_Infection$ligne)   # Transforme ligne en facteur
+
+data2_Infection <- data2_Infection %>%
+  arrange(Date) %>%
+  group_by(colonne, ligne) %>%
+  mutate(Nb_malades_cumule = as.numeric(cumsum(Nb_malades))) # Cumul des malades par bloc
+```
+
+```{r}
+#Ajustement densité ponctuel
+data2_Infection$Nb_malades_dens <- ifelse(data2_Infection$colonne %in% c("A", "F"), 
+                                          data2_Infection$Nb_malades * 2,  # Double si en A ou F
+                                          data2_Infection$Nb_malades)
+
+
+#Ajustement densité pour les cumulés
+data2_Infection$Nb_malades_cumule_dens <- ifelse(data2_Infection$colonne %in% c("A", "F"), 
+                                         data2_Infection$Nb_malades_cumule *2, # Double si en A ou F
+                                         data2_Infection$Nb_malades_cumule)
+```
+
+```{r}
+write.csv(data2_Infection, file = "Infection_Table_clean.csv", row.names = FALSE)
+```
