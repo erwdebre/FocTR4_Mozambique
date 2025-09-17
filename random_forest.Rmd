@@ -171,7 +171,7 @@ for (i in 1:nrow(Infection_Table)) {
   week_i <- Infection_Table$Week[i]
 
   get_voisin_value <- function(l, c) {
-    v <- index %>% dplyr::filter(ligne == l, colonne == c, Week == week_i)
+    v <- index %>% dplyr::filter(ligne == l, colonne == c, Week == week_i-1)
     if (nrow(v) > 0) v$cumudelta else 0
   }
 
@@ -213,7 +213,6 @@ data_ml <- data_model %>% dplyr::select(-semaine, -Bloc)
 
 # Vérification rapide
 summary(data_ml)
-
 ```
 
 
