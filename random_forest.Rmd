@@ -164,7 +164,7 @@ Infection_Table$cumult <- NA_real_
 # Index rapide pour accès aux cumuls
 index <- Infection_Table %>% dplyr::select(ligne, colonne, Week, cumudelta)
 
-# Boucle pour remplir les valeurs des voisins et du bloc lui-même
+# Boucle pour remplir les valeurs des voisins et du bloc lui-même au temps -1
 for (i in 1:nrow(Infection_Table)) {
   ligne_i <- Infection_Table$ligne[i]
   colonne_i <- Infection_Table$colonne[i]
@@ -214,6 +214,8 @@ data_ml <- data_model %>% dplyr::select(-semaine, -Bloc)
 # Vérification rapide
 summary(data_ml)
 ```
+
+
 
 
 
@@ -317,7 +319,7 @@ if (run_rfe) {
 # --- Chargement du résultat du RFE et affichage des variables sélectionnées ---
 
 # Charger le fichier RData contenant l'objet 'rfe_result' issu du RFE
-load(file = "rfe_result_bloc5.RDATA")
+load(file = "rfe_result_clust_GENES.RDATA")
 
 # Extraire les variables sélectionnées par le RFE
 selected_vars <- predictors(rfe_result)
@@ -404,6 +406,7 @@ rename_dict <- c(
   moyenne_lag_pluie_moyenne4_5 = "Moyenne pluie semaine -4 à -5",
   moyenne_lag_pluie_moyenne2_3 = "Moyenne pluie semaine -2 à -3",
   moyenne_lag_pluie_moyenne6_10 = "Moyenne pluie semaine -6 à -10",
+    moyenne_lag_pluie_moyenne11_15 = "Moyenne pluie semaine -11 à -15",
   moyenne_lag_pluie_moyenne0_1 = "Moyenne pluie semaine actuelle à -1",
   pluie_moyenne_lag0 = "Moyenne pluie semaine actuelle"
 )
@@ -428,7 +431,7 @@ corrplot(
   type = "lower",        # partie inférieure de la matrice
   method = "color",      # couleurs pour la force de corrélation
   addCoef.col = "black", # afficher la valeur des corrélations
-  number.cex = 0.8,      # taille du texte
+  number.cex = 1,      # taille du texte
   tl.col = "black",      # couleur des labels
   na.label = " "         # vide pour valeurs manquantes
 )
@@ -456,8 +459,8 @@ ggpairs(
 ) +
   theme_minimal() +
   theme(
-    strip.text.x = element_text(size = 15, angle = 90, hjust = 0), # labels en haut
-    strip.text.y = element_text(size = 15, angle = 0, hjust = 0)   # labels sur côté
+    strip.text.x = element_text(size = 20, angle = 90, hjust = 0), # labels en haut
+    strip.text.y = element_text(size = 20, angle = 0, hjust = 0)   # labels sur côté
   )
 
 
@@ -467,7 +470,7 @@ ggpairs(
 
 ```{r,,fig.height=10,fig.width=10, message=FALSE, warning=FALSE}
 # Extraire les colonnes concernées
-corr_matrix <- cor(data_ml[, c("cumult","haut","droite","moyenne_lag_pluie_moyenne4_5","moyenne_lag_temp_moyenne6_7" ,"moyenne_lag_pluie_moyenne2_3","pluie_moyenne_lag0","moyenne_lag_pluie_moyenne6_10")], use = "pairwise.complete.obs")
+corr_matrix <- cor(data_ml[, c("cumult","haut","droite","moyenne_lag_pluie_moyenne4_5" ,"moyenne_lag_pluie_moyenne2_3","pluie_moyenne_lag0","moyenne_lag_pluie_moyenne6_10","moyenne_lag_pluie_moyenne11_15")], use = "pairwise.complete.obs")
 
 # Renommage des lignes/colonnes de la matrice de corrélation
 var_names <- colnames(corr_matrix)
@@ -487,7 +490,7 @@ corrplot(corr_filtered,
          type = "lower",
          method = "color",
          addCoef.col = "black",
-         number.cex = 0.8,
+         number.cex = 1.5,
          tl.col = "black",
          na.label = " ")
 ```
@@ -508,7 +511,8 @@ rename_dict <- c(
   moyenne_lag_pluie_moyenne4_5 = "Moyenne pluie semaine lag 4 à 5",
   moyenne_lag_pluie_moyenne2_3 = "Moyenne pluie semaine lag 2 à 3",
   pluie_moyenne_lag0 = "Moyenne pluie semaine-même",
-  moyenne_lag_pluie_moyenne6_10 = "Moyenne pluie semaine lag 6 à 10"
+  moyenne_lag_pluie_moyenne6_10 = "Moyenne pluie semaine lag 6 à 10",
+  moyenne_lag_pluie_moyenne11_15 = "Moyenne pluie semaine lag 11 à 15"
 )
 
 # ------------------------------
@@ -528,7 +532,8 @@ data_ml_renamed <- data_ml %>%
     Moyenne.pluie.semaine.lag.4.à.5 = moyenne_lag_pluie_moyenne4_5,
     Moyenne.pluie.semaine.lag.2.à.3 = moyenne_lag_pluie_moyenne2_3,
     Moyenne.pluie.semaine.même = pluie_moyenne_lag0,
-    Moyenne.pluie.semaine.lag.6.à.10 = moyenne_lag_pluie_moyenne6_10
+    Moyenne.pluie.semaine.lag.6.à.10 = moyenne_lag_pluie_moyenne6_10,
+    Moyenne.pluie.semaine.lag.11.à.15 = moyenne_lag_pluie_moyenne11_15
   )
 
 # ------------------------------
@@ -583,14 +588,14 @@ ale_rf_boot <- ALE(
 
 ```
 
-```{r}
+```{r,fig.height=6,fig.width=6}
 # ------------------------------
 # 1. Sélection des variables ALE à tracer
 # vars1 : variables “cumul bloc” (3 premières)
 # vars2 : variables “pluie moyenne” (4 dernières)
 # ------------------------------
 vars1 <- clean_names[1:3]
-vars2 <- tail(clean_names, 4)
+vars2 <- tail(clean_names, 5)
 
 # ------------------------------
 # 2. Graphique ALE pour vars1 (Cumul Bloc)
@@ -645,10 +650,11 @@ ggplot2::ggplot(ale_df1, ggplot2::aes(x = .x, y = ale_mean, color = Variables, f
 
 # Labels lisibles pour les variables pluie
 var_labels2 <- c(
-  "Moyenne.pluie.semaine.lag.4.à.5" = "Semaine -4 à -5",
-  "Moyenne.pluie.semaine.lag.2.à.3" = "Semaine -2 à -3",
   "Moyenne.pluie.semaine.même" = "Semaine actuelle",
-  "Moyenne.pluie.semaine.lag.6.à.10" = "Semaine -6 à -10"
+  "Moyenne.pluie.semaine.lag.2.à.3" = "Semaine -2 à -3",
+  "Moyenne.pluie.semaine.lag.4.à.5" = "Semaine -4 à -5",
+  "Moyenne.pluie.semaine.lag.6.à.10" = "Semaine -6 à -10",
+  "Moyenne.pluie.semaine.lag.11.à.15" = "Semaine -11 à -15"
 )
 
 # Calcul ALE + IC pour pluie
@@ -674,16 +680,37 @@ ale_list2 <- lapply(vars2, function(var) {
 # Combiner les résultats
 ale_df2 <- dplyr::bind_rows(ale_list2)
 
-# Tracer ALE pluie avec IC
-ggplot2::ggplot(ale_df2, ggplot2::aes(x = .x, y = ale_mean, color = Variables, fill = Variables)) +
+
+ggplot2::ggplot(
+  ale_df2,
+  ggplot2::aes(x = .x, y = ale_mean, color = Variables, fill = Variables)
+) +
   ggplot2::geom_line(linewidth = 1.2) +
-  ggplot2::geom_ribbon(ggplot2::aes(ymin = ic_lower, ymax = ic_upper), alpha = 0.2, color = NA) +
-  ggplot2::labs(x = "mm/jour moyen sur la période", y = "Effet ALE", color = "Moyenne Pluie", fill = "Moyenne Pluie") +
+  ggplot2::geom_ribbon(
+    ggplot2::aes(ymin = ic_lower, ymax = ic_upper),
+    alpha = 0.2, color = NA
+  ) +
+  ggplot2::labs(
+    x = "mm/jour moyen sur la période",
+    y = "Effet ALE",
+    color = "Moyenne pluie",
+    fill  = "Moyenne pluie"
+  ) +
+  ggplot2::scale_color_discrete(
+    breaks = var_labels2
+  ) +
+  ggplot2::scale_fill_discrete(
+    breaks = var_labels2
+  ) +
   ggplot2::theme_minimal() +
   ggplot2::theme(
-    legend.position = "bottom",
-    legend.box = "horizontal"
+    legend.position = "bottom"
+  )+
+  ggplot2::guides(
+    color = ggplot2::guide_legend(nrow = 2, byrow = TRUE),
+    fill  = ggplot2::guide_legend(nrow = 2, byrow = TRUE)
   )
+
 
 ```
 
