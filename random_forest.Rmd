@@ -329,7 +329,17 @@ cat("Variables sélectionnées par RFE :\n")
 print(selected_vars)
 
 ```
-`
+```{r}
+library(plyr)
+sel_fin=function (y, size=15) {
+finalImp <- plyr::ddply(y[, c("Overall", "var")], .(var), function(x) mean(x$Overall, na.rm = TRUE))
+names(finalImp)[2] <- "Overall"
+finalImp <- finalImp[order(finalImp$Overall, decreasing = TRUE),]
+    as.character(finalImp$var[1:size])
+}
+sel_fin(rfe_result$variables)
+```
+
 
 
 ```{r}
@@ -490,8 +500,12 @@ corrplot(corr_filtered,
          type = "lower",
          method = "color",
          addCoef.col = "black",
-         number.cex = 1.5,
+         number.cex = 1.65,
          tl.col = "black",
+         tl.cex = 1.65,
+         cl.pos = "r", # << Taille des étiquettes
+         cl.cex = 1.5,       # << Taille de la légende des couleurs
+
          na.label = " ")
 ```
 
